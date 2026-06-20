@@ -1,0 +1,54 @@
+[functions.admin_user_management]
+enabled = true
+verify_jwt = false
+import_map = "./functions/admin_user_management/deno.json"
+# Uncomment to specify a custom file path to the entrypoint.
+# Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
+entrypoint = "./functions/admin_user_management/index.ts"
+# Specifies static files to be bundled with the function. Supports glob patterns.
+# For example, if you want to serve static HTML pages in your function:
+# static_files = [ "./functions/admin_user_management/*.html" ]
+
+[functions.id_management]
+enabled = true
+verify_jwt = true
+import_map = "./functions/id_management/deno.json"
+# Uncomment to specify a custom file path to the entrypoint.
+# Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
+entrypoint = "./functions/id_management/index.ts"
+# Specifies static files to be bundled with the function. Supports glob patterns.
+# For example, if you want to serve static HTML pages in your function:
+# static_files = [ "./functions/id_management/*.html" ]
+
+[functions.sign_in_with_identifier]
+enabled = true
+verify_jwt = false
+import_map = "./functions/sign_in_with_identifier/deno.json"
+# Uncomment to specify a custom file path to the entrypoint.
+# Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
+entrypoint = "./functions/sign_in_with_identifier/index.ts"
+# Specifies static files to be bundled with the function. Supports glob patterns.
+# For example, if you want to serve static HTML pages in your function:
+# static_files = [ "./functions/sign_in_with_identifier/*.html" ]
+
+[functions.admin_update_fieldprovider]
+enabled = true
+verify_jwt = true
+import_map = "./functions/admin_update_fieldprovider/deno.json"
+# Uncomment to specify a custom file path to the entrypoint.
+# Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
+entrypoint = "./functions/admin_update_fieldprovider/index.ts"
+# Specifies static files to be bundled with the function. Supports glob patterns.
+# For example, if you want to serve static HTML pages in your function:
+# static_files = [ "./functions/admin_update_fieldprovider/*.html" ]
+
+[functions.reconcile_stock_alerts_daily]
+enabled = true
+verify_jwt = true
+import_map = "./functions/reconcile_stock_alerts_daily/deno.json"
+# Uncomment to specify a custom file path to the entrypoint.
+# Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
+entrypoint = "./functions/reconcile_stock_alerts_daily/index.ts"
+# Specifies static files to be bundled with the function. Supports glob patterns.
+# For example, if you want to serve static HTML pages in your function:
+# static_files = [ "./functions/reconcile_stock_alerts_daily/*.html" ]
