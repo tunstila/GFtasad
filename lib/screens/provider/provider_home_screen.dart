@@ -65,6 +65,10 @@ class _ProviderHomeScreenState extends State<ProviderHomeScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       context.read<StockAlertService>().refresh();
       context.read<NotificationService>().refresh();
+
+      // Auto-sync any pending offline test records when we return to Home.
+      // This is a lightweight best-effort sync (won't block UI).
+      context.read<TestRecordService>().syncPendingInBackground();
     });
   }
 

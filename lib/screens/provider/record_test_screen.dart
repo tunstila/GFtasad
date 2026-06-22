@@ -48,7 +48,6 @@ class _RecordTestScreenState extends State<RecordTestScreen> {
   final _otherReferralSourceController = TextEditingController();
   final _dangerSignsReferralFacilityController = TextEditingController();
 
-  final Set<String> _malariaClientGroups = {};
   final Set<String> _malariaSymptoms = {};
 
   bool? _firstTimeVisitYes;
@@ -247,6 +246,11 @@ class _RecordTestScreenState extends State<RecordTestScreen> {
       final testRecordService = context.read<TestRecordService>();
       final clientService = context.read<ClientService>();
 
+      final currentUser = authService.currentUser;
+      if (currentUser == null || currentUser.id.trim().isEmpty) {
+        throw Exception('You must be logged in to record a test. Please sign in again.');
+      }
+
       // Phase 1 (fast): local commit only. Do NOT block on any network calls.
       // Ensure we always have a stable clientId for the record, even offline.
       final rawClientId = _clientIdController.text.trim();
@@ -269,9 +273,11 @@ class _RecordTestScreenState extends State<RecordTestScreen> {
             })()
           : null;
 
+      final recordId = _uuid.v4();
       final record = TestRecord(
-        id: _uuid.v4(),
-        userId: authService.currentUser?.id ?? '',
+        id: recordId,
+        clientGeneratedId: recordId,
+        userId: currentUser.id,
         program: _program,
         clientName: _clientNameController.text,
         clientId: localClientId,
@@ -286,9 +292,8 @@ class _RecordTestScreenState extends State<RecordTestScreen> {
             : _visitType,
 
         clientAddress: (_program == HealthProgram.malaria || _program == HealthProgram.hiv) ? _clientAddressController.text.trim() : null,
-        clientGroups: _program == HealthProgram.malaria
-            ? (_malariaClientGroups.toList()..sort())
-            : (_program == HealthProgram.hiv ? (_hivClientGroups.toList()..sort()) : null),
+        // Client Groups are no longer collected for Malaria records.
+        clientGroups: _program == HealthProgram.hiv ? (_hivClientGroups.toList()..sort()) : null,
         firstTimeVisit: _program == HealthProgram.malaria ? _firstTimeVisitYes : null,
         referredFrom: _program == HealthProgram.malaria ? _referredFrom : (_program == HealthProgram.hiv ? _hivReferredFrom : null),
         otherReferralSource: () {
@@ -621,15 +626,6 @@ class _RecordTestScreenState extends State<RecordTestScreen> {
           controller: _clientAddressController,
           decoration: const InputDecoration(labelText: 'Client Address', prefixIcon: Icon(Icons.home)),
           validator: (v) => (v ?? '').trim().isEmpty ? 'Required' : null,
-        ),
-        const SizedBox(height: 16),
-        _MultiSelectChipsFormField(
-          label: 'Client Group',
-          icon: Icons.groups,
-          options: const ['GP', 'Pregnant', 'FSW', 'MSM', 'TG', 'PWID', 'AGYW'],
-          selected: _malariaClientGroups,
-          requiredSelection: false,
-          onChanged: () => setState(() {}),
         ),
         const SizedBox(height: 16),
         DropdownButtonFormField<String>(

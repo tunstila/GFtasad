@@ -66,29 +66,51 @@ class StockRequestService extends ChangeNotifier {
 
   Future<List<User>> fetchSuppliers() async {
     try {
-      final query = SupabaseConfig.client
-          .from('users')
-          .select('*')
-          .ilike('role', UserRole.supplier.name)
-          .ilike('approvalStatus', UserApprovalStatus.approved.name)
-          .order('username', ascending: true);
-      final rows = await query as List;
-      return rows.map((e) => User.fromJson(Map<String, dynamic>.from(e as Map))).toList();
-    } catch (e) {
-      // Back-compat: some environments may still use snake_case `approval_status`.
-      try {
-        final query = SupabaseConfig.client
-            .from('users')
-            .select('*')
-            .ilike('role', UserRole.supplier.name)
-            .ilike('approval_status', UserApprovalStatus.approved.name)
-            .order('username', ascending: true);
-        final rows = await query as List;
-        return rows.map((e) => User.fromJson(Map<String, dynamic>.from(e as Map))).toList();
-      } catch (e2) {
-        debugPrint('Failed to fetch suppliers: $e2');
-        rethrow;
+      // Least-privilege RPC: returns only safe supplier fields (not SETOF public.users).
+      // SECURITY DEFINER derives caller from auth.uid() and enforces role/scope server-side.
+      final res = await SupabaseConfig.client.rpc('get_available_suppliers_for_fieldprovider');
+      final rows = (res as List?) ?? const [];
+      final suppliers = rows.map((e) {
+        final m = Map<String, dynamic>.from(e as Map);
+        // Normalize the RPC's snake_case return columns into what User.fromJson accepts.
+        return User.fromJson({
+          'id': m['id'],
+          'username': m['username'] ?? '',
+          'name': m['name'],
+          'email': m['email'] ?? '',
+          'contact_email': m['contact_email'],
+          'facilityName': m['facility_name'],
+          'ward': m['ward'],
+          'lga': m['lga'],
+          'state': m['state'],
+          'role': m['role'],
+          'approvalstatus': m['approvalstatus'],
+          'created_at': m['created_at'],
+          'updated_at': m['updated_at'],
+        });
+      }).toList();
+
+      if (suppliers.isEmpty) {
+        debugPrint('fetchSuppliers(): get_available_suppliers_for_fieldprovider returned 0 rows. Fetching diagnostics...');
+        try {
+          final diag = await SupabaseConfig.client.rpc('get_available_suppliers_for_fieldprovider_diagnostics');
+          debugPrint('get_available_suppliers_for_fieldprovider_diagnostics: ${jsonEncode(diag)}');
+        } catch (diagErr) {
+          debugPrint('get_available_suppliers_for_fieldprovider_diagnostics failed: $diagErr');
+        }
       }
+
+      return suppliers;
+    } catch (e) {
+      debugPrint('fetchSuppliers(): supplier RPC failed: $e');
+      // Best-effort diagnostics to distinguish RLS/permission vs filter-empty.
+      try {
+        final diag = await SupabaseConfig.client.rpc('get_available_suppliers_for_fieldprovider_diagnostics');
+        debugPrint('get_available_suppliers_for_fieldprovider_diagnostics (after error): ${jsonEncode(diag)}');
+      } catch (diagErr) {
+        debugPrint('get_available_suppliers_for_fieldprovider_diagnostics (after error) failed: $diagErr');
+      }
+      rethrow;
     }
   }
 

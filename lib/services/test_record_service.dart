@@ -74,7 +74,7 @@ class TestRecordService extends ChangeNotifier {
 
     Object? lastErr;
     for (final original in candidates) {
-      final payload = Map<String, dynamic>.from(original);
+      final payload = _stripNulls(Map<String, dynamic>.from(original));
 
       // Ensure legacy age band is present in all payload variants (harmless if column exists).
       if (payload.containsKey('ageBand') && payload.containsKey('age')) {
@@ -90,7 +90,35 @@ class TestRecordService extends ChangeNotifier {
       // Prevent infinite retries if the backend schema is very different.
       for (var attempt = 0; attempt < 10; attempt++) {
         try {
-          await SupabaseService.upsert('test_records', payload, onConflict: 'id');
+          // Prefer idempotency on client_generated_id when the backend supports it.
+          // If the column doesn't exist yet, fall back to id.
+          final onConflictCandidates = <String?>[
+            payload.containsKey('client_generated_id') ? 'client_generated_id' : null,
+            payload.containsKey('clientGeneratedId') ? 'clientGeneratedId' : null,
+            'id',
+          ].whereType<String>().toList();
+
+          List<Map<String, dynamic>> rows = const [];
+          Object? upsertErr;
+          for (final conflict in onConflictCandidates) {
+            try {
+              rows = await SupabaseService.upsert('test_records', payload, onConflict: conflict);
+              upsertErr = null;
+              break;
+            } catch (e) {
+              upsertErr = e;
+              if (!_isSchemaColumnError(e)) rethrow;
+            }
+          }
+          if (upsertErr != null) throw upsertErr;
+          if (rows.isNotEmpty) {
+            // Best-effort: keep remote id in local cache when the backend returns it.
+            final row = rows.first;
+            final remoteId = (row['id'] ?? row['remote_id'] ?? row['remoteId'])?.toString();
+            if (remoteId != null && remoteId.trim().isNotEmpty) {
+              _replaceLocal(record.copyWith(remoteId: remoteId, updatedAt: DateTime.now()));
+            }
+          }
           return;
         } catch (e) {
           lastErr = e;
@@ -149,6 +177,17 @@ class TestRecordService extends ChangeNotifier {
     // If we reached here, none of the candidates worked.
     if (lastErr != null) throw lastErr;
     throw StateError('Unknown Supabase upsert failure for test_records');
+  }
+
+  Map<String, dynamic> _stripNulls(Map<String, dynamic> input) {
+    final out = <String, dynamic>{};
+    for (final entry in input.entries) {
+      final v = entry.value;
+      if (v == null) continue;
+      if (v is String && v.trim().isEmpty) continue;
+      out[entry.key] = v;
+    }
+    return out;
   }
 
   Map<String, dynamic> _fromDbRow(Map<String, dynamic> row) {
@@ -283,6 +322,7 @@ class TestRecordService extends ChangeNotifier {
     // Only map keys that are known to be column names.
     return {
       'id': json['id'],
+      'client_generated_id': json['clientGeneratedId'],
       'user_id': json['userId'],
       'program': json['program'],
       'client_name': json['clientName'],
@@ -340,6 +380,7 @@ class TestRecordService extends ChangeNotifier {
     final json = _normalizeDates(record.toJson());
     return {
       'id': json['id'],
+      'clientgeneratedid': json['clientGeneratedId'],
       'userid': json['userId'],
       'program': json['program'],
       'clientname': json['clientName'],
@@ -507,7 +548,14 @@ class TestRecordService extends ChangeNotifier {
             return null;
           }
         }).whereType<TestRecord>().toList();
-        
+
+        // One-time repair/migration for older local queue payloads.
+        final repaired = _repairLocalQueue(_records);
+        if (repaired.didChange) {
+          _records = repaired.records;
+          await _saveRecords(prefs);
+        }
+
         if (_records.length != decoded.length) {
           await _saveRecords(prefs);
         }
@@ -531,6 +579,40 @@ class TestRecordService extends ChangeNotifier {
     }
   }
 
+  ({List<TestRecord> records, bool didChange}) _repairLocalQueue(List<TestRecord> input) {
+    var changed = false;
+    final out = <TestRecord>[];
+    for (final r in input) {
+      var next = r;
+
+      // Ensure idempotency key exists.
+      if (next.clientGeneratedId.trim().isEmpty) {
+        next = next.copyWith(clientGeneratedId: next.id);
+        changed = true;
+      }
+
+      // Malaria no longer supports Client Groups for NEW submissions.
+      // Keep historical server-synced rows intact; only normalize unsynced local queue items.
+      if (next.program == HealthProgram.malaria && next.syncStatus != SyncStatus.synced && (next.clientGroups?.isNotEmpty ?? false)) {
+        next = next.copyWith(clientGroups: null);
+        changed = true;
+      }
+
+      // Reset recoverable failures back to pending so auto-sync can pick them up.
+      if (next.syncStatus == SyncStatus.failed) {
+        final err = (next.lastError ?? '').toLowerCase();
+        final recoverable = err.contains('timeout') || err.contains('failed to fetch') || err.contains('network') || err.contains('socket') || err.contains('temporary');
+        if (recoverable) {
+          next = next.copyWith(syncStatus: SyncStatus.pending);
+          changed = true;
+        }
+      }
+
+      out.add(next);
+    }
+    return (records: out, didChange: changed);
+  }
+
   /// Performs a real sync:
   /// - pushes pending/failed rows
   /// - pulls latest server rows
@@ -552,18 +634,31 @@ class TestRecordService extends ChangeNotifier {
     final authUser = SupabaseConfig.auth.currentUser;
     if (authUser == null) return;
 
+    // Best-effort: refresh session before attempting queued writes.
+    try {
+      await SupabaseConfig.auth.refreshSession();
+    } catch (e) {
+      debugPrint('Supabase refreshSession failed (non-fatal): $e');
+    }
+
     // Push any pending local records first (idempotent upsert).
     final pending = _records.where((r) => r.syncStatus == SyncStatus.pending || r.syncStatus == SyncStatus.failed).toList();
     if (pending.isNotEmpty) {
       for (final record in pending) {
         try {
-          await _upsertTestRecordRemote(record);
-          _replaceLocal(record.copyWith(syncStatus: SyncStatus.synced, updatedAt: DateTime.now()));
+          final syncing = record.copyWith(syncStatus: SyncStatus.syncing, lastAttemptedAt: DateTime.now(), retryCount: record.retryCount + 1, lastError: null, updatedAt: DateTime.now());
+          _replaceLocal(syncing);
+          await _saveRecords(prefs);
+
+          await _upsertTestRecordRemote(syncing);
+          _replaceLocal(syncing.copyWith(syncStatus: SyncStatus.synced, updatedAt: DateTime.now()));
         } catch (e) {
-          debugPrint('Failed to push pending test record ${record.id}: $e');
-          _replaceLocal(record.copyWith(syncStatus: SyncStatus.failed, updatedAt: DateTime.now()));
+          final msg = e.toString();
+          debugPrint('Failed to push pending test record ${record.id}: $msg');
+          _replaceLocal(record.copyWith(syncStatus: SyncStatus.failed, lastError: msg, lastAttemptedAt: DateTime.now(), retryCount: record.retryCount + 1, updatedAt: DateTime.now()));
         }
       }
+      await _saveRecords(prefs);
     }
 
     // Pull latest records from server.
@@ -635,13 +730,19 @@ class TestRecordService extends ChangeNotifier {
     final authUser = SupabaseConfig.auth.currentUser;
     if (authUser == null) return;
 
+    try {
+      await SupabaseConfig.auth.refreshSession();
+    } catch (e) {
+      debugPrint('Supabase refreshSession failed before single-record sync (non-fatal): $e');
+    }
+
     final local = _findLocalById(recordId);
     if (local == null) return;
 
     // Avoid flipping synced records back into syncing.
     if (local.syncStatus == SyncStatus.synced) return;
 
-    final syncing = local.copyWith(syncStatus: SyncStatus.syncing, updatedAt: DateTime.now());
+    final syncing = local.copyWith(syncStatus: SyncStatus.syncing, lastAttemptedAt: DateTime.now(), retryCount: local.retryCount + 1, lastError: null, updatedAt: DateTime.now());
     _replaceLocal(syncing);
     notifyListeners();
     try {
@@ -664,8 +765,9 @@ class TestRecordService extends ChangeNotifier {
       }
       _lifetimeFetchedAt = null;
     } catch (e) {
-      debugPrint('Background test record sync failed ($recordId): $e');
-      final failed = syncing.copyWith(syncStatus: SyncStatus.failed, updatedAt: DateTime.now());
+      final msg = e.toString();
+      debugPrint('Background test record sync failed ($recordId): $msg');
+      final failed = syncing.copyWith(syncStatus: SyncStatus.failed, lastError: msg, updatedAt: DateTime.now());
       _replaceLocal(failed);
       notifyListeners();
       try {
@@ -748,6 +850,7 @@ class TestRecordService extends ChangeNotifier {
     _records = [
       TestRecord(
         id: _uuid.v4(),
+        clientGeneratedId: _uuid.v4(),
         userId: 'provider1',
         program: HealthProgram.malaria,
         clientName: 'Amina Mohammed',
@@ -768,6 +871,7 @@ class TestRecordService extends ChangeNotifier {
       ),
       TestRecord(
         id: _uuid.v4(),
+        clientGeneratedId: _uuid.v4(),
         userId: 'provider1',
         program: HealthProgram.hiv,
         clientName: 'Chinedu Okafor',
@@ -891,7 +995,7 @@ class TestRecordService extends ChangeNotifier {
   }
 
   int getPendingSyncCount() =>
-      _records.where((r) => r.syncStatus == SyncStatus.pending).length;
+      _records.where((r) => r.syncStatus != SyncStatus.synced).length;
 
   /// Canonical, RLS-respecting lifetime total count.
   ///

@@ -974,7 +974,7 @@ class AuthService extends ChangeNotifier {
       'fieldProviderUniqueId': row['fieldProviderUniqueId'] ?? row['fieldprovideruniqueid'] ?? row['field_provider_unique_id'] ?? row['fieldproviderid'] ?? row['field_provider_id'],
       'forcePasswordChange': row['forcePasswordChange'] ?? row['force_password_change'] ?? false,
       'lastLogin': row['lastLogin'] ?? row['last_login'],
-      'approvalStatus': row['approvalStatus'] ?? row['approval_status'] ?? 'approved',
+      'approvalStatus': row['approvalstatus'] ?? row['approvalStatus'] ?? row['approval_status'] ?? 'approved',
       'approvedAt': row['approvedAt'] ?? row['approved_at'],
       'approvedBy': row['approvedBy'] ?? row['approved_by'],
       'adminScope': row['adminScope'] ?? row['admin_scope'],

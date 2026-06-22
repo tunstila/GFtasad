@@ -30,6 +30,12 @@ enum SyncStatus { pending, syncing, synced, failed }
 
 class TestRecord {
   final String id;
+  /// Stable idempotency key for offline/online sync.
+  ///
+  /// - Generated client-side the first time a record is saved locally.
+  /// - Sent to Supabase during sync.
+  /// - Backed by a unique constraint in the database.
+  final String clientGeneratedId;
   final String userId;
   final HealthProgram program;
   final String clientName;
@@ -96,6 +102,15 @@ class TestRecord {
   // TB specific
   final TBScreening? tbScreening;
   final String? notes;
+
+  /// Remote primary key (if the backend assigns a different id than local [id]).
+  /// In many deployments, the client uses [id] as the primary key; this stays null.
+  final String? remoteId;
+
+  /// Sync diagnostics (kept locally; may be null on older records).
+  final String? lastError;
+  final int retryCount;
+  final DateTime? lastAttemptedAt;
   
   final SyncStatus syncStatus;
   final DateTime createdAt;
@@ -103,6 +118,7 @@ class TestRecord {
 
   TestRecord({
     required this.id,
+    required this.clientGeneratedId,
     required this.userId,
     required this.program,
     required this.clientName,
@@ -151,6 +167,10 @@ class TestRecord {
     this.prepRefSource,
     this.tbScreening,
     this.notes,
+    this.remoteId,
+    this.lastError,
+    this.retryCount = 0,
+    this.lastAttemptedAt,
     this.syncStatus = SyncStatus.pending,
     required this.createdAt,
     required this.updatedAt,
@@ -158,6 +178,7 @@ class TestRecord {
 
   Map<String, dynamic> toJson() => {
     'id': id,
+    'clientGeneratedId': clientGeneratedId,
     'userId': userId,
     'program': program.name,
     'clientName': clientName,
@@ -206,14 +227,32 @@ class TestRecord {
     'prepRefSource': prepRefSource,
     'tbScreening': tbScreening?.name,
     'notes': notes,
+    'remoteId': remoteId,
+    'lastError': lastError,
+    'retryCount': retryCount,
+    'lastAttemptedAt': lastAttemptedAt?.toIso8601String(),
     'syncStatus': syncStatus.name,
     'createdAt': createdAt.toIso8601String(),
     'updatedAt': updatedAt.toIso8601String(),
   };
 
-  factory TestRecord.fromJson(Map<String, dynamic> json) => TestRecord(
-    id: json['id'],
-    userId: json['userId'],
+  factory TestRecord.fromJson(Map<String, dynamic> json) {
+    final id = (json['id'] ?? '').toString();
+    // Backwards compatibility: older local/offline payloads won't have this.
+    final clientGeneratedId = (json['clientGeneratedId'] ?? json['client_generated_id'] ?? json['clientgeneratedid'] ?? id).toString();
+    final rawTestDate = json['testDate'] ?? json['test_date'] ?? json['testdate'];
+    final testDate = rawTestDate == null ? DateTime.now() : DateTime.parse(rawTestDate.toString());
+    final rawCreated = json['createdAt'] ?? json['created_at'] ?? json['createdat'];
+    final rawUpdated = json['updatedAt'] ?? json['updated_at'] ?? json['updatedat'];
+    final createdAt = rawCreated == null ? testDate : DateTime.parse(rawCreated.toString());
+    final updatedAt = rawUpdated == null ? createdAt : DateTime.parse(rawUpdated.toString());
+    final rawSync = (json['syncStatus'] ?? json['sync_status'] ?? json['syncstatus'])?.toString();
+    final syncStatus = SyncStatus.values.firstWhere((e) => e.name == rawSync, orElse: () => SyncStatus.pending);
+
+    return TestRecord(
+      id: id,
+      clientGeneratedId: clientGeneratedId,
+      userId: (json['userId'] ?? json['user_id'] ?? json['userid'] ?? '').toString(),
     program: (() {
       final raw = (json['program'] ?? json['interventionArea'] ?? json['intervention_area'] ?? json['healthProgram'] ?? json['health_program'])?.toString();
       final normalized = (raw ?? '').trim().toLowerCase();
@@ -235,7 +274,7 @@ class TestRecord {
       return DateTime.tryParse(raw.toString());
     })(),
     phoneNumber: json['phoneNumber'] ?? json['phone_number'] ?? json['phone'],
-    testDate: DateTime.parse(json['testDate']),
+    testDate: testDate,
     sex: (json['sex']?.toString() == 'Others') ? 'Other' : (json['sex']?.toString() ?? ''),
     pregnant: json['pregnant'],
     visitType: VisitType.values.firstWhere((e) => e.name == json['visitType']),
@@ -336,13 +375,23 @@ class TestRecord {
     prepRefSource: json['prepRefSource'],
     tbScreening: json['tbScreening'] != null ? TBScreening.values.firstWhere((e) => e.name == json['tbScreening']) : null,
     notes: json['notes'],
-    syncStatus: SyncStatus.values.firstWhere((e) => e.name == json['syncStatus']),
-    createdAt: DateTime.parse(json['createdAt']),
-    updatedAt: DateTime.parse(json['updatedAt']),
-  );
+    remoteId: (json['remoteId'] ?? json['remote_id'] ?? json['remoteid'])?.toString(),
+    lastError: (json['lastError'] ?? json['last_error'] ?? json['lasterror'])?.toString(),
+    retryCount: (json['retryCount'] is num) ? (json['retryCount'] as num).toInt() : int.tryParse((json['retryCount'] ?? '').toString()) ?? 0,
+    lastAttemptedAt: (() {
+      final raw = json['lastAttemptedAt'] ?? json['last_attempted_at'] ?? json['lastattemptedat'];
+      if (raw == null) return null;
+      return DateTime.tryParse(raw.toString());
+    })(),
+    syncStatus: syncStatus,
+    createdAt: createdAt,
+    updatedAt: updatedAt,
+    );
+  }
 
   TestRecord copyWith({
     String? id,
+    String? clientGeneratedId,
     String? userId,
     HealthProgram? program,
     String? clientName,
@@ -391,11 +440,16 @@ class TestRecord {
     String? prepRefSource,
     TBScreening? tbScreening,
     String? notes,
+    String? remoteId,
+    String? lastError,
+    int? retryCount,
+    DateTime? lastAttemptedAt,
     SyncStatus? syncStatus,
     DateTime? createdAt,
     DateTime? updatedAt,
   }) => TestRecord(
     id: id ?? this.id,
+    clientGeneratedId: clientGeneratedId ?? this.clientGeneratedId,
     userId: userId ?? this.userId,
     program: program ?? this.program,
     clientName: clientName ?? this.clientName,
@@ -444,6 +498,10 @@ class TestRecord {
     prepRefSource: prepRefSource ?? this.prepRefSource,
     tbScreening: tbScreening ?? this.tbScreening,
     notes: notes ?? this.notes,
+    remoteId: remoteId ?? this.remoteId,
+    lastError: lastError ?? this.lastError,
+    retryCount: retryCount ?? this.retryCount,
+    lastAttemptedAt: lastAttemptedAt ?? this.lastAttemptedAt,
     syncStatus: syncStatus ?? this.syncStatus,
     createdAt: createdAt ?? this.createdAt,
     updatedAt: updatedAt ?? this.updatedAt,

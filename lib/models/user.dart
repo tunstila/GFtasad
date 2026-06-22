@@ -172,7 +172,7 @@ class User {
       return UserRole.values.firstWhere((e) => e.name == raw, orElse: () => UserRole.fieldProvider);
     })(),
     approvalStatus: (() {
-      final raw = json['approvalStatus']?.toString() ?? json['approval_status']?.toString();
+      final raw = json['approvalstatus']?.toString() ?? json['approvalStatus']?.toString() ?? json['approval_status']?.toString();
       if (raw == null) return (json['isApproved'] == true ? UserApprovalStatus.approved : UserApprovalStatus.approved);
       return UserApprovalStatus.values.firstWhere((e) => e.name == raw, orElse: () => UserApprovalStatus.approved);
     })(),
