@@ -41,15 +41,8 @@ class CommodityDetailScreen extends StatelessWidget {
 
     final computed = inventory.withComputedQuantity(commodity: commodity, userId: userId);
     final unit = inventory.getEffectiveUnitOfExpressionForUser(userId: userId, commodity: commodity);
-    final batchSettings = inventory.getBatchNumberForUser(userId: userId, commodityId: commodity.id);
-    final expirySettings = inventory.getExpiryDateForUser(userId: userId, commodityId: commodity.id);
-
-    final batchRows = (role == UserRole.fieldProvider)
-        ? inventory.getBatchBreakdownForUser(userId: userId, commodityId: commodity.id)
-        : const <InventoryBatchBreakdownRow>[];
-    final expiryRows = (role == UserRole.fieldProvider)
-        ? inventory.getExpiryBreakdownForUser(userId: userId, commodityId: commodity.id)
-        : const <InventoryExpiryBreakdownRow>[];
+    final batch = inventory.getBatchNumberForUser(userId: userId, commodityId: commodity.id);
+    final expiry = inventory.getExpiryDateForUser(userId: userId, commodityId: commodity.id);
     final allMoves = inventory.getMovementsByCommodity(commodity.id);
     final movements = (role?.hasGlobalView ?? false) ? allMoves : allMoves.where((m) => m.userId == userId).toList();
     final ratio = computed.minThreshold <= 0 ? 1.0 : (computed.currentQuantity / (computed.minThreshold * 2)).clamp(0.0, 1.0);
@@ -147,9 +140,9 @@ class CommodityDetailScreen extends StatelessWidget {
                             children: [
                               Text('Batch & expiry', style: context.textStyles.titleSmall?.copyWith(fontWeight: FontWeight.w900)),
                               const SizedBox(height: 10),
-                              _InfoRow(label: 'Batch Number', value: (batchSettings == null || batchSettings.trim().isEmpty) ? 'Not set' : batchSettings),
+                              _InfoRow(label: 'Batch Number', value: (batch == null || batch.trim().isEmpty) ? 'Not set' : batch),
                               const SizedBox(height: 8),
-                              _InfoRow(label: 'Expiry Date', value: expirySettings == null ? 'Not set' : _formatDateOnly(expirySettings)),
+                              _InfoRow(label: 'Expiry Date', value: expiry == null ? 'Not set' : _formatDateOnly(expiry)),
                             ],
                           ),
                         ),
@@ -169,46 +162,6 @@ class CommodityDetailScreen extends StatelessWidget {
                       ],
                     ),
                   ),
-                  const SizedBox(height: 18),
-                  if (role == UserRole.fieldProvider) ...[
-                    Text('Batches', style: context.textStyles.titleLarge?.copyWith(fontWeight: FontWeight.w900)),
-                    const SizedBox(height: 10),
-                    if (batchRows.isEmpty)
-                      Text('No active batches yet. Receive stock to create batch rows.', style: context.textStyles.bodyMedium?.copyWith(color: Theme.of(context).colorScheme.onSurfaceVariant))
-                    else
-                      ...batchRows.map((r) => Padding(
-                            padding: const EdgeInsets.only(bottom: 10),
-                            child: _BatchRowCard(
-                              row: r,
-                              unitOfExpression: unit,
-                              onBackfill: (r.movementIdsWithMissingData.isEmpty)
-                                  ? null
-                                  : () async {
-                                      final targetMovementId = r.movementIdsWithMissingData.first;
-                                      await showModalBottomSheet<void>(
-                                        context: context,
-                                        isScrollControlled: true,
-                                        showDragHandle: true,
-                                        builder: (_) => _BackfillBatchExpiryMovementSheet(
-                                          commodityName: commodity.name,
-                                          unitOfExpression: unit,
-                                          movementId: targetMovementId,
-                                        ),
-                                      );
-                                    },
-                            ),
-                          )),
-                    const SizedBox(height: 18),
-                    Text('Expiry breakdown', style: context.textStyles.titleLarge?.copyWith(fontWeight: FontWeight.w900)),
-                    const SizedBox(height: 10),
-                    if (expiryRows.isEmpty)
-                      Text('No expiry dates recorded yet.', style: context.textStyles.bodyMedium?.copyWith(color: Theme.of(context).colorScheme.onSurfaceVariant))
-                    else
-                      ...expiryRows.map((e) => Padding(
-                            padding: const EdgeInsets.only(bottom: 10),
-                            child: _ExpiryRowCard(row: e, unitOfExpression: unit),
-                          )),
-                  ],
                   const SizedBox(height: 18),
                   Row(
                     children: [
@@ -413,196 +366,6 @@ String _formatDateOnly(DateTime dt) {
   final m = dt.month.toString().padLeft(2, '0');
   final d = dt.day.toString().padLeft(2, '0');
   return '${dt.year}-$m-$d';
-}
-
-class _BatchRowCard extends StatelessWidget {
-  final InventoryBatchBreakdownRow row;
-  final String? unitOfExpression;
-  final VoidCallback? onBackfill;
-
-  const _BatchRowCard({required this.row, required this.unitOfExpression, required this.onBackfill});
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    final batchLabel = (row.batchNumber == null || row.batchNumber!.trim().isEmpty) ? 'Missing batch number' : row.batchNumber!.trim();
-    final expiryLabel = row.expiryDate == null ? 'Missing expiry date' : _formatDateOnly(row.expiryDate!);
-    final qtyLabel = unitOfExpression == null ? '${row.quantity}' : '${row.quantity} $unitOfExpression';
-    final hasMissing = (row.batchNumber == null || row.batchNumber!.trim().isEmpty) || row.expiryDate == null;
-
-    return Container(
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: scheme.surface,
-        borderRadius: BorderRadius.circular(AppRadius.lg),
-        border: Border.all(color: hasMissing ? scheme.error.withValues(alpha: 0.35) : scheme.outline.withValues(alpha: 0.2)),
-      ),
-      child: Row(
-        children: [
-          Container(
-            width: 44,
-            height: 44,
-            decoration: BoxDecoration(color: hasMissing ? scheme.error.withValues(alpha: 0.12) : scheme.primary.withValues(alpha: 0.12), borderRadius: BorderRadius.circular(14)),
-            child: Icon(hasMissing ? Icons.error_outline : Icons.inventory_2, color: hasMissing ? scheme.error : scheme.primary),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(batchLabel, style: context.textStyles.titleSmall?.copyWith(fontWeight: FontWeight.w900)),
-                const SizedBox(height: 6),
-                Text('Expiry: $expiryLabel', style: context.textStyles.bodySmall?.copyWith(color: scheme.onSurfaceVariant)),
-                if (row.lastReceivedAt != null) ...[
-                  const SizedBox(height: 4),
-                  Text('Last received: ${row.lastReceivedAt!.year}-${row.lastReceivedAt!.month.toString().padLeft(2, '0')}-${row.lastReceivedAt!.day.toString().padLeft(2, '0')}', style: context.textStyles.bodySmall?.copyWith(color: scheme.onSurfaceVariant)),
-                ],
-              ],
-            ),
-          ),
-          const SizedBox(width: 10),
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: [
-              Text(qtyLabel, style: context.textStyles.titleMedium?.copyWith(fontWeight: FontWeight.w900)),
-              if (onBackfill != null) ...[
-                const SizedBox(height: 8),
-                OutlinedButton.icon(
-                  onPressed: onBackfill,
-                  icon: Icon(Icons.edit, color: scheme.primary),
-                  label: const Text('Fix missing'),
-                ),
-              ],
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _ExpiryRowCard extends StatelessWidget {
-  final InventoryExpiryBreakdownRow row;
-  final String? unitOfExpression;
-
-  const _ExpiryRowCard({required this.row, required this.unitOfExpression});
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    final expiryLabel = row.expiryDate == null ? 'Missing expiry date' : _formatDateOnly(row.expiryDate!);
-    final qtyLabel = unitOfExpression == null ? '${row.quantity}' : '${row.quantity} $unitOfExpression';
-    return Container(
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(color: scheme.surface, borderRadius: BorderRadius.circular(AppRadius.lg), border: Border.all(color: scheme.outline.withValues(alpha: 0.2))),
-      child: Row(
-        children: [
-          Container(width: 44, height: 44, decoration: BoxDecoration(color: scheme.secondary.withValues(alpha: 0.12), borderRadius: BorderRadius.circular(14)), child: Icon(Icons.event, color: scheme.secondary)),
-          const SizedBox(width: 12),
-          Expanded(child: Text(expiryLabel, style: context.textStyles.titleSmall?.copyWith(fontWeight: FontWeight.w900))),
-          Text(qtyLabel, style: context.textStyles.titleMedium?.copyWith(fontWeight: FontWeight.w900)),
-        ],
-      ),
-    );
-  }
-}
-
-class _BackfillBatchExpiryMovementSheet extends StatefulWidget {
-  final String commodityName;
-  final String? unitOfExpression;
-  final String movementId;
-
-  const _BackfillBatchExpiryMovementSheet({required this.commodityName, required this.unitOfExpression, required this.movementId});
-
-  @override
-  State<_BackfillBatchExpiryMovementSheet> createState() => _BackfillBatchExpiryMovementSheetState();
-}
-
-class _BackfillBatchExpiryMovementSheetState extends State<_BackfillBatchExpiryMovementSheet> {
-  final _batchCtrl = TextEditingController();
-  DateTime? _expiry;
-  bool _saving = false;
-
-  @override
-  void dispose() {
-    _batchCtrl.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final inventory = context.watch<InventoryService>();
-    final now = DateTime.now();
-
-    return SafeArea(
-      child: Padding(
-        padding: EdgeInsets.only(left: 16, right: 16, bottom: 16 + MediaQuery.of(context).viewInsets.bottom, top: 8),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text('Backfill missing batch/expiry', style: context.textStyles.titleLarge?.copyWith(fontWeight: FontWeight.w900)),
-            const SizedBox(height: 6),
-            Text(widget.commodityName, style: context.textStyles.bodyMedium?.copyWith(color: Theme.of(context).colorScheme.onSurfaceVariant)),
-            const SizedBox(height: 14),
-            TextField(controller: _batchCtrl, decoration: const InputDecoration(labelText: 'Batch number', prefixIcon: Icon(Icons.confirmation_number))),
-            const SizedBox(height: 12),
-            InkWell(
-              onTap: () async {
-                final initial = _expiry ?? now.add(const Duration(days: 180));
-                final picked = await showDatePicker(
-                  context: context,
-                  initialDate: initial,
-                  firstDate: now.subtract(const Duration(days: 3650)),
-                  lastDate: now.add(const Duration(days: 3650)),
-                  helpText: 'Select expiry date',
-                );
-                if (picked != null && mounted) setState(() => _expiry = picked);
-              },
-              borderRadius: BorderRadius.circular(AppRadius.lg),
-              child: InputDecorator(
-                decoration: const InputDecoration(labelText: 'Expiry date'),
-                child: Text(_expiry == null ? 'Select a date' : _formatDateOnly(_expiry!)),
-              ),
-            ),
-            const SizedBox(height: 16),
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton.icon(
-                onPressed: _saving
-                    ? null
-                    : () async {
-                        final batch = _batchCtrl.text.trim();
-                        if (batch.isEmpty && _expiry == null) {
-                          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Enter batch number and/or expiry date.')));
-                          return;
-                        }
-                        setState(() => _saving = true);
-                        try {
-                          await inventory.backfillMissingBatchExpiryOnMovement(
-                            movementId: widget.movementId,
-                            batchNumber: batch.isEmpty ? null : batch,
-                            expiryDate: _expiry,
-                          );
-                          if (!context.mounted) return;
-                          context.pop();
-                          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Updated.')));
-                        } catch (e) {
-                          if (!context.mounted) return;
-                          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Could not update: $e')));
-                        } finally {
-                          if (mounted) setState(() => _saving = false);
-                        }
-                      },
-                icon: const Icon(Icons.save, color: Colors.white),
-                label: const Text('Save'),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
 }
 
 class _MovementRow extends StatelessWidget {

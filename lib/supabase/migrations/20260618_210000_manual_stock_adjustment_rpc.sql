@@ -130,16 +130,6 @@ begin
     raise exception 'Selected commodity does not exist';
   end if;
 
-  -- Block adjustments for deactivated products (soft delete). Preserve history, prevent new entries.
-  if exists(
-    select 1
-    from public.commodities c
-    where c.id = p_commodity_id
-      and (coalesce(c.is_active, true) = false or coalesce(c.isactive, true) = false)
-  ) then
-    raise exception 'Selected commodity is no longer available for stock adjustment';
-  end if;
-
   -- Ensure provider settings row exists (for thresholds/alerts)
   insert into public.field_provider_commodity_settings(field_provider_id, commodity_id)
   values (v_uid, p_commodity_id)

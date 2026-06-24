@@ -232,6 +232,25 @@ async function upsertClientForProvider(userId: string, body: any) {
   if (!sex) throw new Error("Client sex is required");
   if (!phoneNumber) throw new Error("Client phone number is required");
 
+  const normalizeTypeSegment = (raw: any): string => {
+    const v = (raw ?? "").toString().trim();
+    if (!v) return "";
+    const cleaned = v.toUpperCase().replace(/[^A-Z]/g, "");
+    if (!cleaned) return "";
+    const first = cleaned.length >= 3 ? cleaned.substring(0, 3) : cleaned.padEnd(3, "X");
+    return first;
+  };
+
+  // Strict: ward/type segment must be real. If the client didn't send it, we
+  // derive from the provider's Business profile (source of truth) and enforce
+  // it is present.
+  let typeSegment = normalizeTypeSegment(body.typeSegment ?? body.ward ?? body.wardSegment ?? "");
+  if (!typeSegment) {
+    const loc = await getProviderLocation(userId);
+    typeSegment = loc3(loc.ward);
+  }
+  if (!typeSegment || typeSegment === "UNK") throw new Error("Cannot allocate client code: provider ward is missing");
+
   // Prefer backend-generated sequential codes: STATE-LGA-TYPE-0000001
   // Desired codes are only honored when they already match the strict format.
   const desiredOk = desiredClientId && /^[A-Z]{3}-[A-Z]{3}-[A-Z]{3}-\d{7}$/.test(desiredClientId.toUpperCase());
@@ -254,7 +273,7 @@ async function upsertClientForProvider(userId: string, body: any) {
   if (!clientId) {
     const { data: code, error: codeErr } = await adminClient.rpc("allocate_client_code", {
       provider_user_id: userId,
-      type_segment: "ALL",
+      type_segment: typeSegment,
     });
     if (codeErr) throw codeErr;
     clientId = (code as any)?.toString?.() ?? String(code ?? "");

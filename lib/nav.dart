@@ -13,7 +13,6 @@ import 'package:mediflow/screens/provider/provider_home_screen.dart';
 import 'package:mediflow/screens/provider/select_program_screen.dart';
 import 'package:mediflow/screens/provider/record_test_screen.dart';
 import 'package:mediflow/screens/provider/record_prevention_messaging_screen.dart';
-import 'package:mediflow/screens/provider/prevention_messaging_history_screen.dart';
 import 'package:mediflow/screens/provider/inventory_screen.dart';
 import 'package:mediflow/screens/provider/commodity_detail_screen.dart';
 import 'package:mediflow/screens/provider/manual_stock_adjustment_screen.dart';
@@ -28,6 +27,7 @@ import 'package:mediflow/screens/provider/sync_status_screen.dart';
 import 'package:mediflow/screens/provider/notifications_screen.dart';
 import 'package:mediflow/screens/provider/stock_alerts_screen.dart';
 import 'package:mediflow/screens/provider/test_records_history_screen.dart';
+import 'package:mediflow/screens/provider/prevention_messaging_records_history_screen.dart';
 import 'package:mediflow/screens/provider/test_record_detail_screen.dart';
 import 'package:mediflow/screens/provider/lifetime_tests_screen.dart';
 import 'package:mediflow/screens/auth/pending_approval_screen.dart';
@@ -36,6 +36,7 @@ import 'package:mediflow/screens/admin/admin_dashboard_screen.dart';
 import 'package:mediflow/screens/admin/fieldprovider_analytics_screen.dart';
 import 'package:mediflow/screens/admin/superadmin_enrollment_screen.dart';
 import 'package:mediflow/screens/admin/superadmin_test_records_analytics_screen.dart';
+import 'package:mediflow/screens/admin/login_tracker_screen.dart';
 import 'package:mediflow/screens/provider/request_stock_screen.dart';
 import 'package:mediflow/screens/provider/stock_requests_screen.dart';
 import 'package:mediflow/screens/provider/stock_request_detail_screen.dart';
@@ -78,6 +79,7 @@ class AppRouter {
         if (loc.startsWith('/admin/dashboard') && !user.hasGlobalView) return auth.homeRouteForCurrentUser();
         if (loc.startsWith('/admin/enrollment') && !user.hasSuperAdminFull) return auth.homeRouteForCurrentUser();
         if (loc.startsWith('/admin/test-records-analytics') && !user.hasSuperAdminFull) return auth.homeRouteForCurrentUser();
+        if (loc.startsWith('/admin/login-tracker') && !user.hasSuperAdminFull) return auth.homeRouteForCurrentUser();
 
         // National read-only dashboards.
         if (loc.startsWith('/national/malaria') && user.role != UserRole.nationalMalaria && !user.hasSuperAdminFull) return auth.homeRouteForCurrentUser();
@@ -90,8 +92,8 @@ class AppRouter {
 
         // Provider-only operational routes.
         if (loc.startsWith('/record-test') && !user.effectiveRole.canRecordTests) return auth.homeRouteForCurrentUser();
+
         if (loc.startsWith('/record-prevention-messaging') && !user.effectiveRole.canRecordTests) return auth.homeRouteForCurrentUser();
-        if (loc.startsWith('/messaging') && !user.effectiveRole.canRecordTests) return auth.homeRouteForCurrentUser();
 
         if (loc.startsWith('/lifetime-tests') && !user.effectiveRole.canRecordTests) return auth.homeRouteForCurrentUser();
 
@@ -147,17 +149,6 @@ class AppRouter {
       GoRoute(
         path: '/record-prevention-messaging',
         builder: (context, state) => const RecordPreventionMessagingScreen(),
-      ),
-      GoRoute(
-        path: '/messaging',
-        builder: (context, state) {
-          final todayOnly = (state.uri.queryParameters['today'] ?? '').trim() == '1';
-          return PreventionMessagingHistoryScreen(todayOnly: todayOnly);
-        },
-      ),
-      GoRoute(
-        path: '/prevention-messaging-history',
-        builder: (context, state) => const PreventionMessagingHistoryScreen(todayOnly: false),
       ),
       GoRoute(
         path: '/inventory',
@@ -285,12 +276,23 @@ class AppRouter {
         },
       ),
       GoRoute(
+        path: '/prevention-messaging-records',
+        builder: (context, state) {
+          final today = state.uri.queryParameters['today'] == '1';
+          return PreventionMessagingRecordsHistoryScreen(todayOnly: today);
+        },
+      ),
+      GoRoute(
         path: '/admin/test-records-analytics',
         builder: (context, state) => const SuperAdminTestRecordsAnalyticsScreen(),
       ),
       GoRoute(
         path: '/admin/dashboard',
         builder: (context, state) => const AdminDashboardScreen(),
+      ),
+      GoRoute(
+        path: '/admin/login-tracker',
+        builder: (context, state) => const LoginTrackerScreen(),
       ),
       GoRoute(
         path: '/admin/analytics/fieldproviders',
@@ -325,7 +327,7 @@ class AppRouter {
       ),
       GoRoute(
         path: '/supplier/stock-requests',
-        builder: (context, state) => SupplierStockRequestsScreen(status: state.uri.queryParameters['status']),
+        builder: (context, state) => const SupplierStockRequestsScreen(),
       ),
       GoRoute(
         path: '/supplier/stock-requests/:requestId',

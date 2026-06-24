@@ -48,7 +48,10 @@ class ClientService extends ChangeNotifier {
   static String generateLocalProvisionalClientId(User? user) {
     final stateCode = NgLocations.stateTo3LetterCode(user?.state) ?? _loc3(user?.state);
     final lgaCode = _loc3(user?.lga);
-    const typeCode = 'ALL';
+    final wardRaw = (user?.ward ?? '').trim();
+    // Strict behavior: never default to ALL. If ward is missing, use UNK for a
+    // clearly-non-canonical offline placeholder.
+    final typeCode = wardRaw.isEmpty ? 'UNK' : _loc3(wardRaw);
 
     final seq = _stable7DigitFromUuidV4();
     final seqStr = seq.toString().padLeft(7, '0');
@@ -84,8 +87,10 @@ class ClientService extends ChangeNotifier {
     required String phoneNumber,
     DateTime? dateOfBirth,
     String? desiredClientId,
+    String? ward,
   }) async {
     try {
+      final wardNorm = (ward ?? '').trim();
       final res = await SupabaseConfig.client.functions.invoke(
         'id_management',
         body: {
@@ -95,6 +100,8 @@ class ClientService extends ChangeNotifier {
           'sex': sex.trim(),
           'phoneNumber': phoneNumber.trim(),
           'dateOfBirth': dateOfBirth?.toIso8601String(),
+          // Backwards-compatible: edge function defaults to ALL when missing.
+          'typeSegment': wardNorm,
         },
       );
 

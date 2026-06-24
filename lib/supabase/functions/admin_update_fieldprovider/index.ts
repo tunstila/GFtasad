@@ -135,13 +135,11 @@ Deno.serve(async (req: Request) => {
 
     const oldUsername = asString(target.username);
     const oldEmail = normalizeEmail(target.email);
-    const oldApproval = asString(target.approvalstatus || target.approvalStatus || target.approval_status).trim().toLowerCase();
+    const oldApproval = asString(target.approvalStatus || target.approval_status).trim().toLowerCase();
 
     const nextUsername = ("username" in patch) ? normalizeUsername(patch.username) : null;
     const nextEmail = ("email" in patch) ? normalizeEmail(patch.email) : null;
-    const nextApproval = ("approvalstatus" in patch || "approvalStatus" in patch || "approval_status" in patch)
-      ? normalizeApprovalStatus((patch as any).approvalstatus ?? patch.approvalStatus ?? patch.approval_status)
-      : null;
+    const nextApproval = ("approvalStatus" in patch || "approval_status" in patch) ? normalizeApprovalStatus(patch.approvalStatus ?? patch.approval_status) : null;
 
     // Validation: email format if provided.
     if (nextEmail !== null) {
@@ -184,14 +182,14 @@ Deno.serve(async (req: Request) => {
 
     // Approval updates + audit fields.
     if (nextApproval !== null && nextApproval !== oldApproval) {
-      userRowUpdates.approvalstatus = nextApproval;
+      userRowUpdates.approvalStatus = nextApproval;
       if (nextApproval === "approved" || nextApproval === "rejected") {
-        userRowUpdates.approvedat = new Date().toISOString();
-        userRowUpdates.approvedby = requesterId;
+        userRowUpdates.approvedAt = new Date().toISOString();
+        userRowUpdates.approvedBy = requesterId;
       }
       if (nextApproval === "pending") {
-        userRowUpdates.approvedat = null;
-        userRowUpdates.approvedby = null;
+        userRowUpdates.approvedAt = null;
+        userRowUpdates.approvedBy = null;
       }
     }
 

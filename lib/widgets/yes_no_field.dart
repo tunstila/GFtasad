@@ -6,7 +6,7 @@ import 'package:flutter/material.dart';
 /// - `value == false` => No
 class YesNoField extends StatelessWidget {
   final String label;
-  final bool value;
+  final bool? value;
   final ValueChanged<bool> onChanged;
   final IconData? icon;
 
@@ -35,8 +35,12 @@ class YesNoField extends StatelessWidget {
               ButtonSegment(value: true, label: Text('Yes')),
               ButtonSegment(value: false, label: Text('No')),
             ],
-            selected: {value},
-            onSelectionChanged: (s) => onChanged(s.first),
+            selected: value == null ? const <bool>{} : {value!},
+            emptySelectionAllowed: true,
+            onSelectionChanged: (s) {
+              if (s.isEmpty) return;
+              onChanged(s.first);
+            },
             showSelectedIcon: false,
             style: ButtonStyle(
               tapTargetSize: MaterialTapTargetSize.shrinkWrap,

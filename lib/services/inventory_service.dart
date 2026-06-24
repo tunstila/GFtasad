@@ -405,14 +405,6 @@ class InventoryService extends ChangeNotifier {
           }
         }).whereType<Commodity>().toList();
 
-        // Local safety filter: this catalog item is deprecated and should not be selectable.
-        // We do NOT delete any historical movements; this only affects future selection.
-        final before = _commodities.length;
-        _commodities = _commodities.where((c) => c.name.trim().toLowerCase() != 'tb screening form').toList();
-        if (_commodities.length != before) {
-          await _saveCommodities(prefs);
-        }
-
         if (_commodities.length != decoded.length) {
           await _saveCommodities(prefs);
         }
@@ -560,14 +552,6 @@ class InventoryService extends ChangeNotifier {
       } catch (e) {
         debugPrint('Default commodity seed failed (continuing with local cache): $e');
       }
-
-      // Soft-deactivated commodities are excluded from selection lists going forward.
-      // Historical inventory movements remain viewable because they reference commodityId.
-      remoteCommodities = remoteCommodities.where((r) {
-        final v = r['is_active'] ?? r['isactive'] ?? r['isActive'];
-        if (v == null) return true;
-        return v == true;
-      }).toList();
 
       final commodityById = {for (final c in _commodities) c.id: c};
       var commoditiesChanged = false;
@@ -756,8 +740,6 @@ class InventoryService extends ChangeNotifier {
         'minthreshold': 0,
         'createdat': nowIso,
         'updatedat': nowIso,
-        'is_active': true,
-        'isactive': true,
       },
       {
         'id': _stableCommodityId('mrdt'),
@@ -768,8 +750,6 @@ class InventoryService extends ChangeNotifier {
         'minthreshold': 0,
         'createdat': nowIso,
         'updatedat': nowIso,
-        'is_active': true,
-        'isactive': true,
       },
       {
         'id': _stableCommodityId('topmal'),
@@ -780,8 +760,6 @@ class InventoryService extends ChangeNotifier {
         'minthreshold': 0,
         'createdat': nowIso,
         'updatedat': nowIso,
-        'is_active': true,
-        'isactive': true,
       },
     ];
 
@@ -1054,121 +1032,6 @@ class InventoryService extends ChangeNotifier {
   List<StockMovement> getMovementsByCommodity(String commodityId) =>
       _movements.where((m) => m.commodityId == commodityId).toList();
 
-  /// Batch-level breakdown derived from stock movements for one provider + commodity.
-  ///
-  /// Missing values are represented as null.
-  List<InventoryBatchBreakdownRow> getBatchBreakdownForUser({required String userId, required String commodityId}) {
-    final relevant = _movements.where((m) => m.userId == userId && m.commodityId == commodityId).toList();
-    final map = <String, InventoryBatchBreakdownRow>{};
-
-    String keyOf(String? batch, DateTime? expiry) {
-      final b = (batch ?? '').trim();
-      final e = expiry == null ? '' : _formatDateOnly(DateTime(expiry.year, expiry.month, expiry.day))!;
-      return '${b.isEmpty ? '∅' : b}|${e.isEmpty ? '∅' : e}';
-    }
-
-    for (final m in relevant) {
-      final batch = (m.batchNumber ?? '').trim().isEmpty ? null : m.batchNumber!.trim();
-      final expiry = m.expiryDate == null ? null : DateTime(m.expiryDate!.year, m.expiryDate!.month, m.expiryDate!.day);
-      final k = keyOf(batch, expiry);
-      final prev = map[k];
-      final delta = m.type == MovementType.add ? m.quantity : -m.quantity;
-      final nextQty = (prev?.quantity ?? 0) + delta;
-
-      map[k] = InventoryBatchBreakdownRow(
-        batchNumber: batch,
-        expiryDate: expiry,
-        quantity: nextQty < 0 ? 0 : nextQty,
-        lastReceivedAt: (() {
-          if (m.type != MovementType.add) return prev?.lastReceivedAt;
-          final existing = prev?.lastReceivedAt;
-          return (existing == null || m.createdAt.isAfter(existing)) ? m.createdAt : existing;
-        })(),
-        movementIdsWithMissingData: {
-          ...?prev?.movementIdsWithMissingData,
-          if (m.type == MovementType.add && (((m.batchNumber ?? '').trim().isEmpty) || m.expiryDate == null)) m.id,
-        }.toList(),
-      );
-    }
-
-    final rows = map.values.where((r) => r.quantity > 0).toList();
-    rows.sort((a, b) {
-      final ae = a.expiryDate;
-      final be = b.expiryDate;
-      if (ae == null && be == null) return (a.batchNumber ?? '').compareTo(b.batchNumber ?? '');
-      if (ae == null) return 1;
-      if (be == null) return -1;
-      return ae.compareTo(be);
-    });
-    return rows;
-  }
-
-  /// Expiry-only breakdown (sum of all batches for each expiry date).
-  List<InventoryExpiryBreakdownRow> getExpiryBreakdownForUser({required String userId, required String commodityId}) {
-    final batches = getBatchBreakdownForUser(userId: userId, commodityId: commodityId);
-    final map = <String, InventoryExpiryBreakdownRow>{};
-    for (final b in batches) {
-      final expiry = b.expiryDate;
-      final k = expiry == null ? '∅' : _formatDateOnly(expiry)!;
-      final prev = map[k];
-      map[k] = InventoryExpiryBreakdownRow(expiryDate: expiry, quantity: (prev?.quantity ?? 0) + b.quantity);
-    }
-    final rows = map.values.toList();
-    rows.sort((a, b) {
-      if (a.expiryDate == null && b.expiryDate == null) return 0;
-      if (a.expiryDate == null) return 1;
-      if (b.expiryDate == null) return -1;
-      return a.expiryDate!.compareTo(b.expiryDate!);
-    });
-    return rows;
-  }
-
-  /// Production-safe: updates missing batch/expiry on one of the caller's own movements.
-  Future<void> backfillMissingBatchExpiryOnMovement({
-    required String movementId,
-    String? batchNumber,
-    DateTime? expiryDate,
-  }) async {
-    final authUser = SupabaseConfig.auth.currentUser;
-    if (authUser == null) throw Exception('Not authenticated');
-
-    final batch = _normalizeBatch(batchNumber);
-    final expiry = expiryDate == null ? null : DateTime(expiryDate.year, expiryDate.month, expiryDate.day);
-    if (batch == null && expiry == null) throw Exception('Provide batch number and/or expiry date');
-
-    try {
-      final res = await SupabaseConfig.client.rpc(
-        'update_my_stock_movement_batch_expiry',
-        params: {
-          'p_movement_id': movementId,
-          'p_batch_number': batch,
-          'p_expiry_date': expiry == null ? null : _formatDateOnly(expiry),
-        },
-      );
-
-      if (res is Map) {
-        final raw = res['movement'];
-        if (raw is Map) {
-          final updated = StockMovement.fromJson(_normalizeDates(raw.cast<String, dynamic>())).copyWith(syncStatus: SyncStatus.synced);
-          _replaceMovement(updated);
-          try {
-            final prefs = await SharedPreferences.getInstance();
-            await _saveMovements(prefs);
-          } catch (e) {
-            debugPrint('Failed to persist movement cache after backfill: $e');
-          }
-          notifyListeners();
-        }
-      }
-
-      // Pull to ensure any other devices/rows stay consistent.
-      await _syncWithSupabase(await SharedPreferences.getInstance());
-    } catch (e) {
-      debugPrint('update_my_stock_movement_batch_expiry RPC failed: $e');
-      rethrow;
-    }
-  }
-
   Future<void> addCommodityToFacility({required String commodityId, required String userId}) async {
     // If the commodity is already assigned (has a movement), do nothing.
     if (_movements.any((m) => m.userId == userId && m.commodityId == commodityId)) return;
@@ -1262,31 +1125,6 @@ class InventoryService extends ChangeNotifier {
       debugPrint('Failed to mark movements synced: $e');
     }
   }
-}
-
-class InventoryBatchBreakdownRow {
-  final String? batchNumber;
-  final DateTime? expiryDate;
-  final int quantity;
-  final DateTime? lastReceivedAt;
-
-  /// Add-movement IDs that contributed to this batch group but have missing batch/expiry.
-  /// Used to offer a safe “backfill” action without editing other providers.
-  final List<String> movementIdsWithMissingData;
-
-  InventoryBatchBreakdownRow({
-    required this.batchNumber,
-    required this.expiryDate,
-    required this.quantity,
-    required this.lastReceivedAt,
-    required this.movementIdsWithMissingData,
-  });
-}
-
-class InventoryExpiryBreakdownRow {
-  final DateTime? expiryDate;
-  final int quantity;
-  InventoryExpiryBreakdownRow({required this.expiryDate, required this.quantity});
 }
 
 extension _FirstOrNullExt<T> on Iterable<T> {

@@ -70,7 +70,15 @@ class SuperAdminAnalyticsService {
   /// Counts only FieldProviders with providerType of ppmv/cp.
   static Future<EnrollmentCounts> fetchEnrollmentCounts() async {
     try {
-      final rows = await SupabaseService.select(_usersTable, select: 'role,providerType,provider_type');
+      // Schema-safe: some deployments use `providerType` (camelCase) only.
+      // Selecting a non-existent column causes PostgREST to throw.
+      List<dynamic> rows;
+      try {
+        rows = await SupabaseService.select(_usersTable, select: 'role,providerType');
+      } catch (_) {
+        // Fallback for older schemas that used snake_case.
+        rows = await SupabaseService.select(_usersTable, select: 'role,provider_type');
+      }
       var ppmv = 0;
       var cp = 0;
       for (final r in rows) {
@@ -95,22 +103,31 @@ class SuperAdminAnalyticsService {
     String? lga,
   }) async {
     try {
-      final select = '''
-        id,username,email,contactEmail,contact_email,role,providerType,provider_type,state,lga,facilityName,facility_name,createdAt,created_at,
+      // Schema-safe: build two select strings and fall back if PostgREST rejects unknown columns.
+      final selectCamel = '''
+        id,username,email,contactEmail,role,providerType,state,lga,facilityName,createdAt,
+        $_addressTable(business_address,ward,state,lga,created_at,updated_at)
+      ''';
+      final selectSnake = '''
+        id,username,email,contact_email,role,provider_type,state,lga,facility_name,created_at,
         $_addressTable(business_address,ward,state,lga,created_at,updated_at)
       ''';
 
-      dynamic q = SupabaseConfig.client.from(_usersTable).select(select);
-      q = q.eq('role', UserRole.fieldProvider.name);
-
-      if (providerType != null) {
-        // Try both naming conventions.
-        q = q.or('providerType.eq.${providerType.name},provider_type.eq.${providerType.name}');
+      Future<List> runQuery({required String select, required String providerTypeCol, required String createdAtCol}) async {
+        dynamic q = SupabaseConfig.client.from(_usersTable).select(select);
+        q = q.eq('role', UserRole.fieldProvider.name);
+        if (providerType != null) q = q.eq(providerTypeCol, providerType.name);
+        if ((state ?? '').trim().isNotEmpty) q = q.eq('state', state);
+        if ((lga ?? '').trim().isNotEmpty) q = q.eq('lga', lga);
+        return (await q.order(createdAtCol, ascending: false)) as List;
       }
-      if ((state ?? '').trim().isNotEmpty) q = q.eq('state', state);
-      if ((lga ?? '').trim().isNotEmpty) q = q.eq('lga', lga);
 
-      final rows = (await q.order('createdAt', ascending: false)) as List;
+      List rows;
+      try {
+        rows = await runQuery(select: selectCamel, providerTypeCol: 'providerType', createdAtCol: 'createdAt');
+      } catch (_) {
+        rows = await runQuery(select: selectSnake, providerTypeCol: 'provider_type', createdAtCol: 'created_at');
+      }
 
       return rows.map((raw) {
         final r = (raw as Map).cast<String, dynamic>();

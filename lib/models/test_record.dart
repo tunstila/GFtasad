@@ -22,7 +22,7 @@ enum HIVSTKitType { oral, bloodBased }
 
 enum HIVSTServiceDeliveryModel { assisted, unassisted }
 
-enum HIVTestResult { reactive, nonReactive }
+enum HIVTestResult { reactive, nonReactive, invalid }
 
 enum TBScreening { tbScreened, tbPresumptive }
 
@@ -30,12 +30,6 @@ enum SyncStatus { pending, syncing, synced, failed }
 
 class TestRecord {
   final String id;
-  /// Stable idempotency key for offline/online sync.
-  ///
-  /// - Generated client-side the first time a record is saved locally.
-  /// - Sent to Supabase during sync.
-  /// - Backed by a unique constraint in the database.
-  final String clientGeneratedId;
   final String userId;
   final HealthProgram program;
   final String clientName;
@@ -58,6 +52,8 @@ class TestRecord {
   final String? referredFrom;
   final String? otherReferralSource;
   final List<String>? symptomsPresented;
+  /// Free-text detail when `symptomsPresented` includes "Others" (Malaria only).
+  final String? otherSymptomsPresented;
   /// Convenience string for malaria mRDT result: "Positive" | "Negative".
   /// (The legacy booleans `mRDTTested` + `mRDTPositive` are still preserved.)
   final String? mRDTResult;
@@ -69,10 +65,11 @@ class TestRecord {
   final bool? mRDTTested;
   final bool? mRDTPositive;
   final bool? actGiven;
-  /// New malaria field: categorical ACT given value (TopMal | Others | None).
-  ///
-  /// Backwards compatibility: legacy [actGiven] boolean may still exist on older rows.
+  /// Malaria ACT option for new flow: "TopMal" | "Others".
+  /// Legacy boolean `actGiven` is preserved for older records/dashboards.
   final String? actGivenOption;
+  /// Free-text detail when `actGivenOption == "Others"`.
+  final String? otherActGiven;
   
   // HIV specific
   final bool? hivCounselling;
@@ -102,15 +99,6 @@ class TestRecord {
   // TB specific
   final TBScreening? tbScreening;
   final String? notes;
-
-  /// Remote primary key (if the backend assigns a different id than local [id]).
-  /// In many deployments, the client uses [id] as the primary key; this stays null.
-  final String? remoteId;
-
-  /// Sync diagnostics (kept locally; may be null on older records).
-  final String? lastError;
-  final int retryCount;
-  final DateTime? lastAttemptedAt;
   
   final SyncStatus syncStatus;
   final DateTime createdAt;
@@ -118,7 +106,6 @@ class TestRecord {
 
   TestRecord({
     required this.id,
-    required this.clientGeneratedId,
     required this.userId,
     required this.program,
     required this.clientName,
@@ -137,6 +124,7 @@ class TestRecord {
     this.referredFrom,
     this.otherReferralSource,
     this.symptomsPresented,
+    this.otherSymptomsPresented,
     this.mRDTResult,
     this.referralForDangerSigns,
     this.dangerSignsReferralFacility,
@@ -145,6 +133,7 @@ class TestRecord {
     this.mRDTPositive,
     this.actGiven,
     this.actGivenOption,
+    this.otherActGiven,
     this.hivCounselling,
     this.hivstType,
     this.determineTest,
@@ -167,10 +156,6 @@ class TestRecord {
     this.prepRefSource,
     this.tbScreening,
     this.notes,
-    this.remoteId,
-    this.lastError,
-    this.retryCount = 0,
-    this.lastAttemptedAt,
     this.syncStatus = SyncStatus.pending,
     required this.createdAt,
     required this.updatedAt,
@@ -178,7 +163,6 @@ class TestRecord {
 
   Map<String, dynamic> toJson() => {
     'id': id,
-    'clientGeneratedId': clientGeneratedId,
     'userId': userId,
     'program': program.name,
     'clientName': clientName,
@@ -197,6 +181,7 @@ class TestRecord {
     'referredFrom': referredFrom,
     'otherReferralSource': otherReferralSource,
     'symptomsPresented': symptomsPresented,
+    'otherSymptomsPresented': otherSymptomsPresented,
     'mRDTResult': mRDTResult,
     'referralForDangerSigns': referralForDangerSigns,
     'dangerSignsReferralFacility': dangerSignsReferralFacility,
@@ -205,6 +190,7 @@ class TestRecord {
     'mRDTPositive': mRDTPositive,
     'actGiven': actGiven,
     'actGivenOption': actGivenOption,
+    'otherActGiven': otherActGiven,
     'hivCounselling': hivCounselling,
     'hivstType': hivstType?.name,
     'determineTest': determineTest?.name,
@@ -227,32 +213,14 @@ class TestRecord {
     'prepRefSource': prepRefSource,
     'tbScreening': tbScreening?.name,
     'notes': notes,
-    'remoteId': remoteId,
-    'lastError': lastError,
-    'retryCount': retryCount,
-    'lastAttemptedAt': lastAttemptedAt?.toIso8601String(),
     'syncStatus': syncStatus.name,
     'createdAt': createdAt.toIso8601String(),
     'updatedAt': updatedAt.toIso8601String(),
   };
 
-  factory TestRecord.fromJson(Map<String, dynamic> json) {
-    final id = (json['id'] ?? '').toString();
-    // Backwards compatibility: older local/offline payloads won't have this.
-    final clientGeneratedId = (json['clientGeneratedId'] ?? json['client_generated_id'] ?? json['clientgeneratedid'] ?? id).toString();
-    final rawTestDate = json['testDate'] ?? json['test_date'] ?? json['testdate'];
-    final testDate = rawTestDate == null ? DateTime.now() : DateTime.parse(rawTestDate.toString());
-    final rawCreated = json['createdAt'] ?? json['created_at'] ?? json['createdat'];
-    final rawUpdated = json['updatedAt'] ?? json['updated_at'] ?? json['updatedat'];
-    final createdAt = rawCreated == null ? testDate : DateTime.parse(rawCreated.toString());
-    final updatedAt = rawUpdated == null ? createdAt : DateTime.parse(rawUpdated.toString());
-    final rawSync = (json['syncStatus'] ?? json['sync_status'] ?? json['syncstatus'])?.toString();
-    final syncStatus = SyncStatus.values.firstWhere((e) => e.name == rawSync, orElse: () => SyncStatus.pending);
-
-    return TestRecord(
-      id: id,
-      clientGeneratedId: clientGeneratedId,
-      userId: (json['userId'] ?? json['user_id'] ?? json['userid'] ?? '').toString(),
+  factory TestRecord.fromJson(Map<String, dynamic> json) => TestRecord(
+    id: (json['id'] ?? json['ID'] ?? '').toString(),
+    userId: (json['userId'] ?? json['user_id'] ?? json['userid'] ?? json['created_by'] ?? json['createdBy'] ?? '').toString(),
     program: (() {
       final raw = (json['program'] ?? json['interventionArea'] ?? json['intervention_area'] ?? json['healthProgram'] ?? json['health_program'])?.toString();
       final normalized = (raw ?? '').trim().toLowerCase();
@@ -264,20 +232,20 @@ class TestRecord {
       if (token.contains('hiv')) return HealthProgram.hiv;
       return HealthProgram.values.firstWhere((e) => e.name == normalized, orElse: () => HealthProgram.malaria);
     })(),
-    clientName: json['clientName'],
-    clientId: json['clientId'],
+    clientName: (json['clientName'] ?? json['client_name'] ?? json['clientname'] ?? '').toString(),
+    clientId: (json['clientId'] ?? json['client_id'] ?? json['clientid'] ?? '').toString(),
     age: (json['age'] is num) ? (json['age'] as num).toInt() : int.tryParse((json['age'] ?? '').toString()),
-    ageBand: json['ageBand'],
+    ageBand: json['ageBand'] ?? json['age_band'] ?? json['ageband'],
     dateOfBirth: (() {
-      final raw = json['dateOfBirth'] ?? json['dob'] ?? json['date_of_birth'];
+      final raw = json['dateOfBirth'] ?? json['dob'] ?? json['date_of_birth'] ?? json['dateofbirth'];
       if (raw == null) return null;
       return DateTime.tryParse(raw.toString());
     })(),
-    phoneNumber: json['phoneNumber'] ?? json['phone_number'] ?? json['phone'],
-    testDate: testDate,
-    sex: (json['sex']?.toString() == 'Others') ? 'Other' : (json['sex']?.toString() ?? ''),
+    phoneNumber: json['phoneNumber'] ?? json['phone_number'] ?? json['phonenumber'] ?? json['phone'],
+    testDate: DateTime.parse((json['testDate'] ?? json['test_date'] ?? json['testdate']).toString()),
+    sex: ((json['sex'] ?? '').toString() == 'Others') ? 'Other' : (json['sex']?.toString() ?? ''),
     pregnant: json['pregnant'],
-    visitType: VisitType.values.firstWhere((e) => e.name == json['visitType']),
+    visitType: VisitType.values.firstWhere((e) => e.name == (json['visitType'] ?? json['visit_type'] ?? json['visittype']).toString()),
     clientAddress: json['clientAddress'] ?? json['client_address'] ?? json['clientaddress'],
     clientGroups: (() {
       final raw = json['clientGroups'] ?? json['client_groups'] ?? json['clientgroups'];
@@ -295,19 +263,21 @@ class TestRecord {
       if (raw is List) return raw.map((e) => e.toString()).where((e) => e.trim().isNotEmpty).toList();
       return raw.toString().split(',').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
     })(),
+    otherSymptomsPresented: json['otherSymptomsPresented'] ?? json['other_symptoms_presented'] ?? json['othersymptomspresented'],
     mRDTResult: json['mRDTResult'] ?? json['mrdt_result'] ?? json['mrdtresult'],
     referralForDangerSigns: json['referralForDangerSigns'] ?? json['referral_for_danger_signs'] ?? json['referralfordangersigns'],
     dangerSignsReferralFacility: json['dangerSignsReferralFacility'] ?? json['danger_signs_referral_facility'] ?? json['dangersignsreferralfacility'],
-    feverPresented: json['feverPresented'],
-    mRDTTested: json['mRDTTested'],
-    mRDTPositive: json['mRDTPositive'],
-    actGiven: json['actGiven'],
-    actGivenOption: (json['actGivenOption'] ?? json['act_given_option'] ?? json['actgivenoption'])?.toString(),
-    hivCounselling: json['hivCounselling'],
+    feverPresented: json['feverPresented'] ?? json['fever_presented'] ?? json['feverpresented'],
+    mRDTTested: json['mRDTTested'] ?? json['mrdt_tested'] ?? json['mrdttested'],
+    mRDTPositive: json['mRDTPositive'] ?? json['mrdt_positive'] ?? json['mrdtpositive'],
+    actGiven: json['actGiven'] ?? json['act_given'] ?? json['actgiven'],
+    actGivenOption: json['actGivenOption'] ?? json['act_given_option'] ?? json['actgivenoption'],
+    otherActGiven: json['otherActGiven'] ?? json['other_act_given'] ?? json['otheractgiven'],
+    hivCounselling: json['hivCounselling'] ?? json['hiv_counselling'] ?? json['hivcounselling'],
     hivstType: json['hivstType'] != null ? HIVTestType.values.firstWhere((e) => e.name == json['hivstType']) : null,
     determineTest: json['determineTest'] != null ? HIVResult.values.firstWhere((e) => e.name == json['determineTest']) : null,
     artLinkage: json['artLinkage'] != null ? HIVLinkage.values.firstWhere((e) => e.name == json['artLinkage']) : null,
-    referralFacility: json['referralFacility'],
+    referralFacility: json['referralFacility'] ?? json['referral_facility'] ?? json['referralfacility'],
     hivPreviousTesting: (() {
       final raw = json['hivPreviousTesting'] ?? json['hiv_previous_testing'] ?? json['hivprevioustesting'];
       if (raw == null) return null;
@@ -347,10 +317,16 @@ class TestRecord {
     hivTestResult: (() {
       final raw = json['hivTestResult'] ?? json['hiv_test_result'] ?? json['hivtestresult'];
       if (raw == null) return null;
-      final token = raw.toString();
+      final token = raw.toString().trim();
+      if (token.isEmpty) return null;
+      final lowered = token.toLowerCase();
       for (final e in HIVTestResult.values) {
-        if (e.name == token) return e;
+        if (e.name.toLowerCase() == lowered) return e;
       }
+      // Backward compatibility for older text values.
+      if (lowered == 'non-reactive' || lowered == 'non reactive') return HIVTestResult.nonReactive;
+      if (lowered == 'reactive') return HIVTestResult.reactive;
+      if (lowered == 'invalid') return HIVTestResult.invalid;
       return null;
     })(),
     tbSymptomsPresented: (() {
@@ -375,23 +351,13 @@ class TestRecord {
     prepRefSource: json['prepRefSource'],
     tbScreening: json['tbScreening'] != null ? TBScreening.values.firstWhere((e) => e.name == json['tbScreening']) : null,
     notes: json['notes'],
-    remoteId: (json['remoteId'] ?? json['remote_id'] ?? json['remoteid'])?.toString(),
-    lastError: (json['lastError'] ?? json['last_error'] ?? json['lasterror'])?.toString(),
-    retryCount: (json['retryCount'] is num) ? (json['retryCount'] as num).toInt() : int.tryParse((json['retryCount'] ?? '').toString()) ?? 0,
-    lastAttemptedAt: (() {
-      final raw = json['lastAttemptedAt'] ?? json['last_attempted_at'] ?? json['lastattemptedat'];
-      if (raw == null) return null;
-      return DateTime.tryParse(raw.toString());
-    })(),
-    syncStatus: syncStatus,
-    createdAt: createdAt,
-    updatedAt: updatedAt,
-    );
-  }
+    syncStatus: SyncStatus.values.firstWhere((e) => e.name == (json['syncStatus'] ?? json['sync_status'] ?? json['syncstatus']).toString()),
+    createdAt: DateTime.parse((json['createdAt'] ?? json['created_at'] ?? json['createdat']).toString()),
+    updatedAt: DateTime.parse((json['updatedAt'] ?? json['updated_at'] ?? json['updatedat']).toString()),
+  );
 
   TestRecord copyWith({
     String? id,
-    String? clientGeneratedId,
     String? userId,
     HealthProgram? program,
     String? clientName,
@@ -410,6 +376,7 @@ class TestRecord {
     String? referredFrom,
     String? otherReferralSource,
     List<String>? symptomsPresented,
+    String? otherSymptomsPresented,
     String? mRDTResult,
     bool? referralForDangerSigns,
     String? dangerSignsReferralFacility,
@@ -418,6 +385,7 @@ class TestRecord {
     bool? mRDTPositive,
     bool? actGiven,
     String? actGivenOption,
+    String? otherActGiven,
     bool? hivCounselling,
     HIVTestType? hivstType,
     HIVResult? determineTest,
@@ -440,16 +408,11 @@ class TestRecord {
     String? prepRefSource,
     TBScreening? tbScreening,
     String? notes,
-    String? remoteId,
-    String? lastError,
-    int? retryCount,
-    DateTime? lastAttemptedAt,
     SyncStatus? syncStatus,
     DateTime? createdAt,
     DateTime? updatedAt,
   }) => TestRecord(
     id: id ?? this.id,
-    clientGeneratedId: clientGeneratedId ?? this.clientGeneratedId,
     userId: userId ?? this.userId,
     program: program ?? this.program,
     clientName: clientName ?? this.clientName,
@@ -468,6 +431,7 @@ class TestRecord {
     referredFrom: referredFrom ?? this.referredFrom,
     otherReferralSource: otherReferralSource ?? this.otherReferralSource,
     symptomsPresented: symptomsPresented ?? this.symptomsPresented,
+    otherSymptomsPresented: otherSymptomsPresented ?? this.otherSymptomsPresented,
     mRDTResult: mRDTResult ?? this.mRDTResult,
     referralForDangerSigns: referralForDangerSigns ?? this.referralForDangerSigns,
     dangerSignsReferralFacility: dangerSignsReferralFacility ?? this.dangerSignsReferralFacility,
@@ -476,6 +440,7 @@ class TestRecord {
     mRDTPositive: mRDTPositive ?? this.mRDTPositive,
     actGiven: actGiven ?? this.actGiven,
     actGivenOption: actGivenOption ?? this.actGivenOption,
+    otherActGiven: otherActGiven ?? this.otherActGiven,
     hivCounselling: hivCounselling ?? this.hivCounselling,
     hivstType: hivstType ?? this.hivstType,
     determineTest: determineTest ?? this.determineTest,
@@ -498,10 +463,6 @@ class TestRecord {
     prepRefSource: prepRefSource ?? this.prepRefSource,
     tbScreening: tbScreening ?? this.tbScreening,
     notes: notes ?? this.notes,
-    remoteId: remoteId ?? this.remoteId,
-    lastError: lastError ?? this.lastError,
-    retryCount: retryCount ?? this.retryCount,
-    lastAttemptedAt: lastAttemptedAt ?? this.lastAttemptedAt,
     syncStatus: syncStatus ?? this.syncStatus,
     createdAt: createdAt ?? this.createdAt,
     updatedAt: updatedAt ?? this.updatedAt,

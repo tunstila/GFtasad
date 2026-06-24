@@ -157,20 +157,16 @@ class _ProgramDetailsCard extends StatelessWidget {
           if ((record.referredFrom ?? '').trim().isNotEmpty) _KV(label: 'Referred from', value: record.referredFrom!.trim()),
           if ((record.otherReferralSource ?? '').trim().isNotEmpty) _KV(label: 'Other referral source', value: record.otherReferralSource!.trim()),
           if ((record.symptomsPresented ?? const []).isNotEmpty) _KV(label: 'Symptoms presented', value: record.symptomsPresented!.join(', ')),
+          if ((record.otherSymptomsPresented ?? '').trim().isNotEmpty) _KV(label: 'Other symptom(s)', value: record.otherSymptomsPresented!.trim()),
           if ((record.mRDTResult ?? '').trim().isNotEmpty) _KV(label: 'mRDT result', value: record.mRDTResult!.trim()) else ...[
             _BoolKV(label: 'mRDT tested', value: record.mRDTTested),
             _BoolKV(label: 'mRDT positive', value: record.mRDTPositive),
           ],
-          _KV(
-            label: 'ACT given',
-            value: (() {
-              final opt = (record.actGivenOption ?? '').trim();
-              if (opt.isNotEmpty) return opt;
-              if (record.actGiven == null) return '—';
-              return record.actGiven == true ? 'Yes (legacy)' : 'No (legacy)';
-            })(),
-          ),
-          const SizedBox(height: 8),
+          if ((record.actGivenOption ?? '').trim().isNotEmpty) ...[
+            _KV(label: 'ACT given', value: record.actGivenOption!.trim()),
+            if ((record.otherActGiven ?? '').trim().isNotEmpty) _KV(label: 'Other ACT', value: record.otherActGiven!.trim()),
+          ] else
+            _BoolKV(label: 'ACT given', value: record.actGiven),
           if (record.referralForDangerSigns != null) _KV(label: 'Referral for danger signs', value: record.referralForDangerSigns == true ? 'Yes' : 'No'),
           if ((record.dangerSignsReferralFacility ?? '').trim().isNotEmpty) _KV(label: 'Referral facility', value: record.dangerSignsReferralFacility!.trim()),
           if ((record.dangerSignsReferralFacility ?? '').trim().isEmpty && (record.referralFacility ?? '').trim().isNotEmpty) _KV(label: 'Referral facility', value: record.referralFacility!.trim()),
@@ -180,18 +176,17 @@ class _ProgramDetailsCard extends StatelessWidget {
         rows = [
           if ((record.clientAddress ?? '').trim().isNotEmpty) _KV(label: 'Client address', value: record.clientAddress!.trim()),
           if ((record.clientGroups ?? const []).isNotEmpty) _KV(label: 'Client group', value: record.clientGroups!.join(', ')),
-          _KV(label: 'Visit Type', value: record.visitType == VisitType.newVisit ? 'New Visit' : 'Return Visit'),
-          const SizedBox(height: 8),
+          if (record.firstTimeVisit != null) _KV(label: 'First time visit', value: record.firstTimeVisit == true ? 'Yes' : 'No'),
           if ((record.referredFrom ?? '').trim().isNotEmpty) _KV(label: 'Referred from', value: record.referredFrom!.trim()),
           if ((record.otherReferralSource ?? '').trim().isNotEmpty) _KV(label: 'Other referral source', value: record.otherReferralSource!.trim()),
-          _KV(label: 'Previous HIV testing', value: record.hivPreviousTesting?.name ?? '—'),
+          _KV(label: 'Previous HIV testing', value: _hivPreviousTestingLabel(record.hivPreviousTesting) ?? '—'),
           _BoolKV(label: 'HIV counselling provided', value: record.hivCounselling),
           _KV(label: 'HTS Type', value: record.htsType?.name ?? '—'),
           if (record.htsType == HTSType.hivst) ...[
             _KV(label: 'HIVST type', value: record.hivstKitType?.name ?? '—'),
             _KV(label: 'HIVST model', value: record.hivstServiceDeliveryModel?.name ?? '—'),
           ],
-          _KV(label: 'HIV test result', value: record.hivTestResult?.name ?? '—'),
+          _KV(label: 'HIV test result', value: _hivTestResultLabel(record.hivTestResult) ?? '—'),
           if ((record.tbSymptomsPresented ?? const []).isNotEmpty) _KV(label: 'TB symptoms', value: record.tbSymptomsPresented!.join(', ')),
           if ((record.referralServices ?? const []).isNotEmpty) _KV(label: 'Referred for', value: record.referralServices!.join(', ')),
           if ((record.otherReferralService ?? '').trim().isNotEmpty) _KV(label: 'Other referral', value: record.otherReferralService!.trim()),
@@ -235,6 +230,21 @@ class _ProgramDetailsCard extends StatelessWidget {
     );
   }
 }
+
+String? _hivTestResultLabel(HIVTestResult? v) => switch (v) {
+  HIVTestResult.reactive => 'Reactive',
+  HIVTestResult.nonReactive => 'Non-reactive',
+  HIVTestResult.invalid => 'Invalid',
+  null => null,
+};
+
+String? _hivPreviousTestingLabel(HIVPreviousTesting? v) => switch (v) {
+  HIVPreviousTesting.notPreviouslyTested => 'Not previously tested',
+  HIVPreviousTesting.previouslyTestedNegative => 'Previously tested negative',
+  HIVPreviousTesting.previouslyTestedPositive => 'Previously tested positive on HIV care',
+  HIVPreviousTesting.previouslyTestedPositiveNotOnCare => 'Previously tested positive not on HIV care',
+  null => null,
+};
 
 class _KV extends StatelessWidget {
   final String label;

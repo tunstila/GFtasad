@@ -94,6 +94,11 @@ class BusinessAddressService {
     }
   }
 
+  /// Cache the address locally without attempting a remote write.
+  ///
+  /// Useful when the canonical write already happened via an RPC.
+  static Future<void> cacheOnly(BusinessAddress address) => _cacheLocal(address);
+
   static Future<void> _cacheLocal(BusinessAddress address) async {
     try {
       final prefs = await SharedPreferences.getInstance();

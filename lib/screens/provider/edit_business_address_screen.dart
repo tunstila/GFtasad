@@ -20,6 +20,8 @@ class EditBusinessAddressScreen extends StatefulWidget {
 
 class _EditBusinessAddressScreenState extends State<EditBusinessAddressScreen> {
   final _addressController = TextEditingController();
+  final _latController = TextEditingController();
+  final _lngController = TextEditingController();
 
   String? _state;
   String? _lga;
@@ -54,6 +56,13 @@ class _EditBusinessAddressScreenState extends State<EditBusinessAddressScreen> {
     _lat ??= user.latitude;
     _lng ??= user.longitude;
 
+    if (_latController.text.trim().isEmpty && _lat != null) {
+      _latController.text = _lat!.toStringAsFixed(6);
+    }
+    if (_lngController.text.trim().isEmpty && _lng != null) {
+      _lngController.text = _lng!.toStringAsFixed(6);
+    }
+
     // Ward options depend on State+LGA.
     _loadWardsForSelection();
   }
@@ -61,7 +70,15 @@ class _EditBusinessAddressScreenState extends State<EditBusinessAddressScreen> {
   @override
   void dispose() {
     _addressController.dispose();
+    _latController.dispose();
+    _lngController.dispose();
     super.dispose();
+  }
+
+  double? _parseNullableDouble(String raw) {
+    final t = raw.trim();
+    if (t.isEmpty) return null;
+    return double.tryParse(t);
   }
 
   Future<void> _loadWardsForSelection() async {
@@ -118,31 +135,85 @@ class _EditBusinessAddressScreenState extends State<EditBusinessAddressScreen> {
 
   bool _wardInvalid = false;
 
+  void _showLocationMessage(String message, {bool isError = false}) {
+    if (!mounted) return;
+    final scheme = Theme.of(context).colorScheme;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: isError ? scheme.error : null,
+        behavior: SnackBarBehavior.floating,
+        action: (!kIsWeb && message.toLowerCase().contains('settings'))
+            ? SnackBarAction(label: 'Open settings', textColor: scheme.onPrimary, onPressed: () => Geolocator.openAppSettings())
+            : null,
+      ),
+    );
+  }
+
   Future<void> _captureLocation() async {
+    if (_locating) return;
     setState(() => _locating = true);
     try {
-      final enabled = await Geolocator.isLocationServiceEnabled();
+      // 1) Check if location services are enabled (GPS / system location).
+      bool enabled;
+      try {
+        enabled = await Geolocator.isLocationServiceEnabled();
+      } catch (e) {
+        debugPrint('isLocationServiceEnabled failed: $e');
+        _showLocationMessage(
+          kIsWeb
+              ? 'This browser does not support location, or location is blocked. You can enter coordinates manually.'
+              : 'This device does not support location services. You can enter coordinates manually.',
+          isError: true,
+        );
+        return;
+      }
       if (!enabled) {
-        throw Exception('Location services are disabled. Please enable location services and try again.');
+        _showLocationMessage('Location services are turned off. Please enable Location and try again.', isError: true);
+        return;
       }
 
+      // 2) Check permission status.
       var permission = await Geolocator.checkPermission();
       if (permission == LocationPermission.denied) {
+        // 3) Request permission if currently denied.
         permission = await Geolocator.requestPermission();
       }
-      if (permission == LocationPermission.denied || permission == LocationPermission.deniedForever) {
-        throw Exception('Location permission not granted.');
+      if (permission == LocationPermission.denied) {
+        _showLocationMessage('Location permission was denied. You can still enter coordinates manually.', isError: true);
+        return;
+      }
+      if (permission == LocationPermission.deniedForever) {
+        _showLocationMessage(
+          'Location permission is permanently denied. Enable it in your device/browser settings, then try again.',
+          isError: true,
+        );
+        return;
       }
 
-      final pos = await Geolocator.getCurrentPosition(locationSettings: const LocationSettings(accuracy: LocationAccuracy.high));
+      // 4) Read GPS coordinates only after permission is granted.
+      final pos = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(accuracy: LocationAccuracy.high, timeLimit: Duration(seconds: 15)),
+      );
       setState(() {
         _lat = pos.latitude;
         _lng = pos.longitude;
+        _latController.text = _lat!.toStringAsFixed(6);
+        _lngController.text = _lng!.toStringAsFixed(6);
       });
+      _showLocationMessage('Location captured successfully.');
     } catch (e) {
       debugPrint('Failed to capture location: $e');
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Could not capture location: $e')));
+      final raw = e.toString().toLowerCase();
+      if (raw.contains('timeout') || raw.contains('timed out') || raw.contains('time limit')) {
+        _showLocationMessage('Timed out while getting your GPS location. Try again or enter coordinates manually.', isError: true);
+      } else if (raw.contains('location services are disabled')) {
+        _showLocationMessage('Location services are turned off. Please enable Location and try again.', isError: true);
+      } else if (raw.contains('permission')) {
+        _showLocationMessage('Location permission is required to capture coordinates. You can enter them manually.', isError: true);
+      } else {
+        _showLocationMessage('Could not capture location. Please try again or enter coordinates manually.', isError: true);
+      }
     } finally {
       if (mounted) setState(() => _locating = false);
     }
@@ -194,6 +265,25 @@ class _EditBusinessAddressScreenState extends State<EditBusinessAddressScreen> {
       }
     }
 
+    final latParsed = _parseNullableDouble(_latController.text);
+    final lngParsed = _parseNullableDouble(_lngController.text);
+    if (_latController.text.trim().isNotEmpty && latParsed == null) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Latitude must be a number.')));
+      return;
+    }
+    if (_lngController.text.trim().isNotEmpty && lngParsed == null) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Longitude must be a number.')));
+      return;
+    }
+    if (latParsed != null && (latParsed < -90 || latParsed > 90)) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Latitude must be between -90 and 90.')));
+      return;
+    }
+    if (lngParsed != null && (lngParsed < -180 || lngParsed > 180)) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Longitude must be between -180 and 180.')));
+      return;
+    }
+
     setState(() => _saving = true);
     try {
       final updated = await auth.updateBusinessProfile(
@@ -201,15 +291,17 @@ class _EditBusinessAddressScreenState extends State<EditBusinessAddressScreen> {
         ward: wardSelected.isEmpty ? null : wardSelected,
         state: _state!,
         lga: _lga!,
-        latitude: _lat,
-        longitude: _lng,
+        latitude: latParsed,
+        longitude: lngParsed,
       );
       if (!mounted) return;
       if (updated) {
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Business profile updated')));
         context.pop();
       } else {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Failed to save. Please try again.')));
+        final err = auth.lastBusinessProfileError;
+        final msg = (err == null || err.trim().isEmpty) ? 'Failed to save. Please try again.' : err;
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
       }
     } catch (e) {
       if (!mounted) return;
@@ -354,6 +446,42 @@ class _EditBusinessAddressScreenState extends State<EditBusinessAddressScreen> {
                   Text(
                     (_lat == null || _lng == null) ? 'Not captured' : 'Lat: ${_lat!.toStringAsFixed(6)}  •  Lng: ${_lng!.toStringAsFixed(6)}',
                     style: context.textStyles.bodyMedium?.copyWith(color: scheme.onSurfaceVariant, fontWeight: FontWeight.w700),
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: _latController,
+                          keyboardType: const TextInputType.numberWithOptions(decimal: true, signed: true),
+                          decoration: InputDecoration(
+                            labelText: 'Latitude',
+                            hintText: 'e.g. 6.524379',
+                            filled: true,
+                            fillColor: scheme.surface,
+                            border: OutlineInputBorder(borderRadius: BorderRadius.circular(AppRadius.lg), borderSide: BorderSide(color: scheme.outline.withValues(alpha: 0.2))),
+                            enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(AppRadius.lg), borderSide: BorderSide(color: scheme.outline.withValues(alpha: 0.2))),
+                          ),
+                          onChanged: (v) => setState(() => _lat = double.tryParse(v.trim())),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: TextField(
+                          controller: _lngController,
+                          keyboardType: const TextInputType.numberWithOptions(decimal: true, signed: true),
+                          decoration: InputDecoration(
+                            labelText: 'Longitude',
+                            hintText: 'e.g. 3.379206',
+                            filled: true,
+                            fillColor: scheme.surface,
+                            border: OutlineInputBorder(borderRadius: BorderRadius.circular(AppRadius.lg), borderSide: BorderSide(color: scheme.outline.withValues(alpha: 0.2))),
+                            enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(AppRadius.lg), borderSide: BorderSide(color: scheme.outline.withValues(alpha: 0.2))),
+                          ),
+                          onChanged: (v) => setState(() => _lng = double.tryParse(v.trim())),
+                        ),
+                      ),
+                    ],
                   ),
                   if (kIsWeb) ...[
                     const SizedBox(height: 8),

@@ -83,18 +83,18 @@ class ProgramColors {
   static const malaria = Color(0xFF10B981);
   static const malariaLight = Color(0xFFD1FAE5);
   static const malariaDark = Color(0xFF059669);
-
+  
   static const hiv = Color(0xFFEF4444);
   static const hivLight = Color(0xFFFEE2E2);
   static const hivDark = Color(0xFFDC2626);
-
+  
   static const tb = Color(0xFFF97316);
   static const tbLight = Color(0xFFFFEDD5);
   static const tbDark = Color(0xFFEA580C);
-
-  static const preventionMessaging = Color(0xFF6366F1);
-  static const preventionMessagingLight = Color(0xFFE0E7FF);
-  static const preventionMessagingDark = Color(0xFF4F46E5);
+  
+  static const prevention = Color(0xFF3B82F6);
+  static const preventionLight = Color(0xFFDBEAFE);
+  static const preventionDark = Color(0xFF2563EB);
 }
 
 /// Alert severity colors

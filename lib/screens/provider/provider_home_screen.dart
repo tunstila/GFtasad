@@ -8,10 +8,8 @@ import 'package:mediflow/services/test_record_service.dart';
 import 'package:mediflow/services/inventory_service.dart';
 import 'package:mediflow/services/delivery_service.dart';
 import 'package:mediflow/services/notification_service.dart';
-import 'package:mediflow/services/prevention_messaging_service.dart';
 import 'package:mediflow/services/stock_alert_service.dart';
-import 'package:mediflow/models/stock_request.dart';
-import 'package:mediflow/services/stock_request_service.dart';
+import 'package:mediflow/services/prevention_messaging_record_service.dart';
 import 'package:mediflow/models/delivery.dart';
 import 'package:mediflow/theme.dart';
 import 'package:mediflow/widgets/offline_banner.dart';
@@ -30,24 +28,12 @@ class ProviderHomeScreen extends StatefulWidget {
 
 class _ProviderHomeScreenState extends State<ProviderHomeScreen> {
   bool _bootstrappedAdminSnapshot = false;
-  String? _supplierRequestsLoadedForUserId;
 
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
     final auth = context.read<AuthService>();
     final user = auth.currentUser;
-
-    // Supplier: load once per signed-in user to avoid fetch loops caused by provider notifications.
-    if (user != null && user.role == UserRole.supplier) {
-      if (_supplierRequestsLoadedForUserId != user.id) {
-        _supplierRequestsLoadedForUserId = user.id;
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          context.read<StockRequestService>().loadForSupplier(user.id);
-        });
-      }
-    }
-
     if (!_bootstrappedAdminSnapshot && user?.hasGlobalView == true) {
       _bootstrappedAdminSnapshot = true;
       WidgetsBinding.instance.addPostFrameCallback((_) async {
@@ -65,10 +51,6 @@ class _ProviderHomeScreenState extends State<ProviderHomeScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       context.read<StockAlertService>().refresh();
       context.read<NotificationService>().refresh();
-
-      // Auto-sync any pending offline test records when we return to Home.
-      // This is a lightweight best-effort sync (won't block UI).
-      context.read<TestRecordService>().syncPendingInBackground();
     });
   }
 
@@ -79,123 +61,22 @@ class _ProviderHomeScreenState extends State<ProviderHomeScreen> {
     final inventoryService = context.watch<InventoryService>();
     final deliveryService = context.watch<DeliveryService>();
     final stockAlertService = context.watch<StockAlertService>();
-    final stockRequestService = context.watch<StockRequestService>();
+    final prevention = context.watch<PreventionMessagingRecordService>();
 
     final user = authService.currentUser;
     final userId = user?.id ?? '';
-
-    // =========================================================
-    // Supplier Home
-    // =========================================================
-    if (user?.role == UserRole.supplier) {
-      final incoming = stockRequestService.supplierRequests.where((r) => r.status == StockRequestStatus.pending).length;
-      final rejected = stockRequestService.supplierRequests.where((r) => r.status == StockRequestStatus.rejected).length;
-      final fulfilled = stockRequestService.supplierRequests.where((r) => r.status == StockRequestStatus.approved).length;
-      final pendingDeliveries = deliveryService.getPendingDeliveriesCountForSupplier(userId);
-
-      return Scaffold(
-        body: SafeArea(
-          child: Column(
-            children: [
-              const OfflineBanner(isOffline: false),
-              Expanded(
-                child: RefreshIndicator(
-                  onRefresh: () async {
-                    await Future.wait([
-                      stockRequestService.loadForSupplier(userId),
-                      deliveryService.initialize(),
-                    ]);
-                  },
-                  child: SingleChildScrollView(
-                    padding: AppSpacing.paddingLg,
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Row(
-                          children: [
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text('Supplier Dashboard', style: context.textStyles.bodyLarge?.copyWith(color: Theme.of(context).colorScheme.onSurfaceVariant)),
-                                  const SizedBox(height: 4),
-                                  Text(user?.displayName ?? 'Supplier', style: context.textStyles.headlineMedium?.copyWith(fontWeight: FontWeight.bold)),
-                                ],
-                              ),
-                            ),
-                            const AppAccountMenu(),
-                          ],
-                        ),
-                        const SizedBox(height: 24),
-                        Row(
-                          children: [
-                            Expanded(
-                              child: MetricCard(
-                                title: 'Incoming Requests',
-                                value: '$incoming',
-                                icon: Icons.inbox,
-                                color: incoming > 0 ? AlertColors.info : null,
-                                onTap: () => context.push('/supplier/stock-requests?status=pending'),
-                              ),
-                            ),
-                            const SizedBox(width: 12),
-                            Expanded(
-                              child: MetricCard(
-                                title: 'Rejected Requests',
-                                value: '$rejected',
-                                icon: Icons.block,
-                                color: rejected > 0 ? AlertColors.warning : null,
-                                onTap: () => context.push('/supplier/stock-requests?status=rejected'),
-                              ),
-                            ),
-                          ],
-                        ),
-                        const SizedBox(height: 12),
-                        Row(
-                          children: [
-                            Expanded(
-                              child: MetricCard(
-                                title: 'Fulfilled Requests',
-                                value: '$fulfilled',
-                                icon: Icons.task_alt,
-                                color: fulfilled > 0 ? AlertColors.success : null,
-                                onTap: () => context.push('/supplier/stock-requests?status=approved'),
-                              ),
-                            ),
-                            const SizedBox(width: 12),
-                            Expanded(
-                              child: MetricCard(
-                                title: 'Pending Deliveries',
-                                value: '$pendingDeliveries',
-                                icon: Icons.local_shipping,
-                                color: pendingDeliveries > 0 ? AlertColors.info : null,
-                                onTap: () => context.push('/deliveries'),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-        bottomNavigationBar: ProviderBottomNav(currentIndex: 0, deliveryBadge: pendingDeliveries),
-      );
-    }
-
     final todayCounts = (user?.hasGlobalView ?? false)
         ? testRecordService.getTodayCountsByProgramAll()
         : testRecordService.getTodayCountsByProgram(userId);
     final stockAlertsUnread = stockAlertService.unreadActiveCount;
     final pendingDeliveries = deliveryService.getPendingDeliveriesCount(user?.id ?? '');
-    final pendingSync = testRecordService.getPendingSyncCount();
+    final pendingSync = testRecordService.getPendingSyncCount() + prevention.getPendingSyncCount();
     final lifetimeCountFuture = (user?.hasGlobalView ?? false)
         ? testRecordService.fetchLifetimeTotalCount()
         : testRecordService.fetchLifetimeTotalCount(userId: userId);
-    final messagingTodayFuture = context.read<PreventionMessagingService>().fetchMyTodayCount();
+
+    final preventionTodayLocal = userId.isEmpty ? 0 : prevention.localTodayCount(userId);
+    final preventionTodayFuture = userId.isEmpty ? null : prevention.fetchTodayTotalCount(userId: userId);
 
     final recentTests = userId.isEmpty
         ? const <TestRecord>[]
@@ -220,7 +101,6 @@ class _ProviderHomeScreenState extends State<ProviderHomeScreen> {
                     (user?.hasGlobalView ?? false) ? testRecordService.syncAllForAdmin() : testRecordService.initialize(),
                     inventoryService.initialize(),
                     deliveryService.initialize(),
-                    context.read<PreventionMessagingService>().initialize(),
                   ]);
                 },
                 child: SingleChildScrollView(
@@ -367,34 +247,15 @@ class _ProviderHomeScreenState extends State<ProviderHomeScreen> {
                           ),
                           const SizedBox(width: 12),
                           Expanded(
-                            child: FutureBuilder<int?>(
-                              future: messagingTodayFuture,
-                              builder: (context, snap) {
-                                final v = snap.data;
-                                final fallback = context.read<PreventionMessagingService>().localMyTodayCount(userId);
-                                final effective = v ?? fallback;
-                                return MetricCard(
-                                  title: 'Messaging',
-                                  value: '$effective',
-                                  icon: Icons.campaign,
-                                  color: effective > 0 ? ProgramColors.preventionMessaging : null,
-                                  onTap: () => context.push('/messaging?today=1'),
-                                );
-                              },
+                            child: MetricCard(
+                              title: 'Notifications',
+                              value: '${context.watch<NotificationService>().unreadCount}',
+                              icon: Icons.notifications_none,
+                              color: context.watch<NotificationService>().unreadCount > 0 ? AlertColors.info : null,
+                              onTap: () => context.push('/notifications'),
                             ),
                           ),
                         ],
-                      ),
-                      const SizedBox(height: 12),
-                      SizedBox(
-                        width: double.infinity,
-                        child: MetricCard(
-                          title: 'Notifications',
-                          value: '${context.watch<NotificationService>().unreadCount}',
-                          icon: Icons.notifications_none,
-                          color: context.watch<NotificationService>().unreadCount > 0 ? AlertColors.info : null,
-                          onTap: () => context.push('/notifications'),
-                        ),
                       ),
                       const SizedBox(height: 24),
                       Text(
@@ -414,6 +275,15 @@ class _ProviderHomeScreenState extends State<ProviderHomeScreen> {
                         context,
                         HealthProgram.hiv,
                         todayCounts[HealthProgram.hiv] ?? 0,
+                      ),
+                      const SizedBox(height: 12),
+                      FutureBuilder<int?>(
+                        future: preventionTodayFuture,
+                        builder: (context, snap) {
+                          final remote = snap.data;
+                          final effective = remote == null ? preventionTodayLocal : math.max(remote, preventionTodayLocal);
+                          return _buildPreventionMessagingCard(context, effective);
+                        },
                       ),
 
                       const SizedBox(height: 24),
@@ -500,6 +370,67 @@ class _ProviderHomeScreenState extends State<ProviderHomeScreen> {
                   const SizedBox(height: 8),
                   Text(
                     '$count test${count != 1 ? 's' : ''} recorded today',
+                    style: context.textStyles.bodyMedium?.copyWith(
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            Text(
+              '$count',
+              style: context.textStyles.headlineLarge?.copyWith(
+                fontWeight: FontWeight.bold,
+                color: color,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPreventionMessagingCard(BuildContext context, int count) {
+    final color = ProgramColors.prevention;
+    return GestureDetector(
+      onTap: () => context.push('/prevention-messaging-records?today=1'),
+      child: Container(
+        padding: const EdgeInsets.all(20),
+        decoration: BoxDecoration(
+          color: color.withValues(alpha: 0.08),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: color.withValues(alpha: 0.2), width: 1),
+        ),
+        child: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: color.withValues(alpha: 0.15),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Icon(Icons.campaign, color: color, size: 28),
+            ),
+            const SizedBox(width: 16),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    decoration: BoxDecoration(
+                      color: color.withValues(alpha: 0.12),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: color.withValues(alpha: 0.4), width: 1),
+                    ),
+                    child: Text(
+                      'PREVENTION MESSAGING',
+                      style: context.textStyles.labelSmall?.copyWith(color: color, fontWeight: FontWeight.w700),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    '$count record${count != 1 ? 's' : ''} created today',
                     style: context.textStyles.bodyMedium?.copyWith(
                       color: Theme.of(context).colorScheme.onSurfaceVariant,
                     ),

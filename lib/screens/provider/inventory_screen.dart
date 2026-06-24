@@ -254,10 +254,7 @@ class _AddProductToFacilitySheetState extends State<_AddProductToFacilitySheet> 
   Widget build(BuildContext context) {
     final inventory = context.watch<InventoryService>();
     final query = _searchCtrl.text.trim().toLowerCase();
-    final available = inventory.commodities
-        .where((c) => c.name.trim().toLowerCase() != 'tb screening form')
-        .where((c) => query.isEmpty || c.name.toLowerCase().contains(query))
-        .toList();
+    final available = inventory.commodities.where((c) => query.isEmpty || c.name.toLowerCase().contains(query)).toList();
 
     return SafeArea(
       child: Padding(

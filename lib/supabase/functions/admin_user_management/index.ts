@@ -266,12 +266,12 @@ Deno.serve(async (req: Request) => {
         email: requesterEmail,
         username: (authUser.user_metadata?.username as string | undefined) ?? "Super Admin",
         role: "superAdmin",
-        approvalstatus: "approved",
-        approvedat: now,
-        approvedby: requesterId,
-        forcepasswordchange: false,
-        createdat: now,
-        updatedat: now,
+        approval_status: "approved",
+        approved_at: now,
+        approved_by: requesterId,
+        force_password_change: false,
+        created_at: now,
+        updated_at: now,
       };
 
       // Minimal variants: some schemas may not have approval/forcePasswordChange columns.
@@ -377,9 +377,9 @@ Deno.serve(async (req: Request) => {
         lga: params.lga ?? null,
         state: params.state ?? null,
         force_password_change: true,
-        approvalstatus: "approved",
-        approvedat: now,
-        approvedby: params.requesterId,
+        approval_status: "approved",
+        approved_at: now,
+        approved_by: params.requesterId,
         created_at: now,
         updated_at: now,
       };
@@ -579,7 +579,7 @@ Deno.serve(async (req: Request) => {
         state: u.state,
         forcePasswordChange: u.forcePasswordChange ?? u.force_password_change,
         lastLogin: u.lastLogin ?? u.last_login,
-        approvalStatus: u.approvalstatus ?? u.approvalStatus ?? u.approval_status,
+        approvalStatus: u.approvalStatus ?? u.approval_status,
         approvedAt: u.approvedAt ?? u.approved_at,
         approvedBy: u.approvedBy ?? u.approved_by,
         adminScope: u.adminScope ?? u.admin_scope,
@@ -601,8 +601,11 @@ Deno.serve(async (req: Request) => {
           adminDb,
           "users",
           {
-            approvalstatus: "approved",
+            approvalStatus: "approved",
+            approval_status: "approved",
+            approvedAt: now,
             approved_at: now,
+            approvedBy: requesterId,
             approved_by: requesterId,
             updatedAt: now,
             updated_at: now,
@@ -708,7 +711,8 @@ Deno.serve(async (req: Request) => {
       if (!isBootstrapTarget) {
         if (role) baseUpdates.role = role;
         if (approvalStatus) {
-          baseUpdates.approvalstatus = approvalStatus;
+          baseUpdates.approvalStatus = approvalStatus;
+          baseUpdates.approval_status = approvalStatus;
         }
 
         if (approvalStatus === "approved") {
@@ -719,7 +723,8 @@ Deno.serve(async (req: Request) => {
         }
       } else {
         // Protect bootstrap super admin from being locked out.
-        baseUpdates.approvalstatus = "approved";
+        baseUpdates.approvalStatus = "approved";
+        baseUpdates.approval_status = "approved";
       }
 
       // Best-effort admin scope persistence.

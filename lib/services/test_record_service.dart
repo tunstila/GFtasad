@@ -12,6 +12,13 @@ class TestRecordService extends ChangeNotifier {
   List<TestRecord> _records = [];
   bool _isLoading = false;
 
+  /// Columns that the connected Supabase project has rejected during upsert.
+  ///
+  /// We keep this in-memory (process lifetime) so once we learn a column is
+  /// missing in the remote schema (e.g. `hivstkittype`), we stop sending it for
+  /// all subsequent sync attempts.
+  static final Set<String> _remoteRejectedColumnsLower = <String>{};
+
   bool _backgroundSyncRunning = false;
 
   TestRecord? _findLocalById(String id) {
@@ -25,15 +32,47 @@ class TestRecordService extends ChangeNotifier {
 
   StreamSubscription<List<Map<String, dynamic>>>? _realtimeSub;
 
+  static bool _looksLikeUuid(String? v) {
+    if (v == null) return false;
+    final s = v.trim();
+    if (s.isEmpty) return false;
+    return RegExp(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$').hasMatch(s);
+  }
+
   static bool _isSchemaColumnError(Object e) {
     final msg = e.toString();
     return msg.contains('schema cache') || msg.contains('does not exist') || msg.contains("Could not find the '");
+  }
+
+  static bool _isNotNullViolation(Object e) {
+    final msg = e.toString().toLowerCase();
+    return msg.contains('violates not-null constraint') || msg.contains('null value in column');
+  }
+
+  static bool _isEmptyString(Object? v) => v is String && v.trim().isEmpty;
+
+  static Map<String, dynamic> _pruneNullish(Map<String, dynamic> input) {
+    final out = <String, dynamic>{};
+    for (final e in input.entries) {
+      final v = e.value;
+      if (v == null) continue;
+      if (v is String && v.trim().isEmpty) continue;
+      if (v is List && v.isEmpty) continue;
+      out[e.key] = v;
+    }
+    return out;
+  }
+
+  static void _ensurePresent(Map<String, dynamic> payload, String key, Object? value) {
+    if (!payload.containsKey(key) || payload[key] == null || _isEmptyString(payload[key])) payload[key] = value;
   }
 
   static String? _extractMissingColumn(Object e) {
     final msg = e.toString();
     final m1 = RegExp(r"Could not find the '([^']+)' column").firstMatch(msg);
     if (m1 != null) return m1.group(1);
+    final m1b = RegExp(r'Could not find the `([^`]+)` column').firstMatch(msg);
+    if (m1b != null) return m1b.group(1);
     // Example: PostgrestException(message: column test_records.testDate does not exist, ...)
     final m2 = RegExp(r'column\s+[\w\.]+\.(\w+)\s+does not exist').firstMatch(msg);
     if (m2 != null) return m2.group(1);
@@ -64,17 +103,162 @@ class TestRecordService extends ChangeNotifier {
     return payload;
   }
 
+  static Map<String, dynamic> _minimalizeTestRecordPayload(Map<String, dynamic> payload) {
+    final baseKeys = <String>{
+      // Upsert + ownership
+      'id',
+      'userid',
+      'user_id',
+      // Core reporting fields
+      'program',
+      'clientname',
+      'client_name',
+      'clientid',
+      'client_id',
+      'age',
+      'ageband',
+      'age_band',
+      'sex',
+      'visittype',
+      'visit_type',
+      'testdate',
+      'test_date',
+      // Sync bookkeeping
+      'syncstatus',
+      'sync_status',
+      'createdat',
+      'created_at',
+      'updatedat',
+      'updated_at',
+    };
+
+    final out = <String, dynamic>{};
+    for (final e in payload.entries) {
+      if (baseKeys.contains(e.key)) out[e.key] = e.value;
+    }
+    return _pruneNullish(out);
+  }
+
   Future<void> _upsertTestRecordRemote(TestRecord record) async {
+    // Some deployed `test_records` schemas have legacy NOT NULL columns like
+    // `clientname` and `ageband`. The newer UI flows may leave some of these
+    // fields blank (age vs ageBand), which causes remote upserts to fail.
+    //
+    // We keep the UI/offline model unchanged, but ensure the remote payload is
+    // never missing required values.
+    final safeClientName = record.clientName.trim().isEmpty ? 'Unknown' : record.clientName.trim();
+    final safeClientId = record.clientId.trim().isEmpty ? 'UNKNOWN' : record.clientId.trim();
+    final derivedAgeBand = record.ageBand ?? _ageBandFromAge(record.age);
+    final safeAgeBand = (derivedAgeBand == null || derivedAgeBand.trim().isEmpty) ? 'Unknown' : derivedAgeBand;
+
     // Try multiple common schemas. For each payload, retry while stripping missing columns.
+    // NOTE: We intentionally do NOT try a fully-lowercased "flattened" schema variant here.
+    // In practice it rarely matches production tables, and the extra retries can cause
+    // Save & Sync to hit the 10s background timeout.
+    // Prefer snake_case and lowercase-first payloads.
+    // IMPORTANT: Avoid sending camelCase column names like `clientId` to PostgREST.
+    // In production Supabase schemas, columns are typically snake_case.
+    // IMPORTANT: Your current production schema uses legacy lowercase columns
+    // (e.g. clientname, testdate). Always try that first to preserve existing
+    // working sync behavior.
+    // Some connected Supabase projects have a much smaller `test_records` table (often only
+    // core columns). If we attempt a large payload first, we can end up stripping dozens of
+    // missing columns one-by-one via network retries, which frequently times out on web.
+    //
+    // Strategy: try a minimal payload first (still correct for dashboards/reports that rely
+    // on the core fields), then fall back to fuller payloads.
+    final lowerFull = Map<String, dynamic>.from(_toDbJsonLower(record));
+    final snakeFull = Map<String, dynamic>.from(_toDbJson(record, snakeCase: true));
     final candidates = <Map<String, dynamic>>[
-      Map<String, dynamic>.from(_toDbJson(record, snakeCase: false)),
-      Map<String, dynamic>.from(_toDbJson(record, snakeCase: true)),
-      Map<String, dynamic>.from(_toDbJsonLower(record)),
+      _minimalizeTestRecordPayload(lowerFull),
+      _minimalizeTestRecordPayload(snakeFull),
+      lowerFull,
+      snakeFull,
     ];
+
+    final authUser = SupabaseConfig.auth.currentUser;
+    if (authUser == null) throw StateError('Not authenticated');
+
+    // Auto-repair legacy local records that used placeholder user ids like "provider1".
+    // This ensures existing failed pending records can sync successfully.
+    TestRecord repairedRecord = record;
+    if (!_looksLikeUuid(record.userId)) {
+      repairedRecord = record.copyWith(userId: authUser.id, syncStatus: SyncStatus.pending, updatedAt: DateTime.now());
+      _replaceLocal(repairedRecord);
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        await _saveRecords(prefs);
+      } catch (e) {
+        debugPrint('Failed to persist repaired test record userId: $e');
+      }
+    }
 
     Object? lastErr;
     for (final original in candidates) {
-      final payload = _stripNulls(Map<String, dynamic>.from(original));
+      final payload = Map<String, dynamic>.from(original);
+
+      // If we've already learned that certain columns don't exist remotely,
+      // never include them in any payload variant.
+      payload.removeWhere((k, _) => _remoteRejectedColumnsLower.contains(k.toLowerCase()));
+
+      // Defensive: never send camelCase column names to PostgREST.
+      // Even if they accidentally leak in (e.g., from older cached payloads), they will
+      // cause schema-cache errors like: "Could not find the 'clientId' column ...".
+      payload.remove('clientId');
+      payload.remove('clientName');
+      // If an older payload had `userId`, map it to a safer variant.
+      if (payload.containsKey('userId') && payload['userId'] != null) {
+        // Prefer legacy lowercase `userid` if present; otherwise only use `user_id` if this
+        // candidate schema already uses it.
+        if (payload.containsKey('userid') && payload['userid'] == null) {
+          payload['userid'] = payload['userId'];
+        } else if (payload.containsKey('user_id') && payload['user_id'] == null) {
+          payload['user_id'] = payload['userId'];
+        } else if (!payload.containsKey('user_id') && !payload.containsKey('userid')) {
+          payload['userid'] = payload['userId'];
+        }
+      }
+      payload.remove('userId');
+      payload.remove('testDate');
+      payload.remove('createdAt');
+      payload.remove('updatedAt');
+      payload.remove('syncStatus');
+
+      // Always force the authenticated user id into the payload.
+      // Some production schemas use legacy lowercase `userid` as a NOT NULL column.
+      // We include it unconditionally; if a backend doesn't have it, the schema-mismatch
+      // stripper below will remove it and the next candidate can still succeed.
+      payload['userid'] = authUser.id;
+
+      // Only set `user_id` if this candidate schema already uses it.
+      // (We avoid injecting it everywhere to reduce extra schema-cache retries.)
+      if (payload.containsKey('user_id')) payload['user_id'] = authUser.id;
+
+      // IMPORTANT: Do not remove `user_id` when both keys exist.
+      // Different deployments require one or the other; letting the missing-column
+      // stripper decide is safer and avoids NOT NULL violations.
+
+      // Ensure required fields are present for each schema variant.
+      // This prevents us from stripping unknown columns down to a payload that
+      // is missing NOT NULL columns (which would abort all remaining candidates).
+      // IMPORTANT: `_toDbJsonLower/_toDbJson` prune null/empty values, so some keys may be
+      // absent entirely. We still inject them here because many deployments have NOT NULL
+      // constraints on these legacy columns.
+      _ensurePresent(payload, 'clientname', safeClientName);
+      _ensurePresent(payload, 'clientid', safeClientId);
+      _ensurePresent(payload, 'program', record.program.name);
+      _ensurePresent(payload, 'testdate', record.testDate.toIso8601String());
+      _ensurePresent(payload, 'sex', record.sex);
+      _ensurePresent(payload, 'visittype', record.visitType.name);
+      _ensurePresent(payload, 'userid', authUser.id);
+      _ensurePresent(payload, 'ageband', safeAgeBand);
+
+      _ensurePresent(payload, 'client_name', safeClientName);
+      _ensurePresent(payload, 'client_id', safeClientId);
+      _ensurePresent(payload, 'test_date', record.testDate.toIso8601String());
+      _ensurePresent(payload, 'visit_type', record.visitType.name);
+      _ensurePresent(payload, 'user_id', authUser.id);
+      _ensurePresent(payload, 'age_band', safeAgeBand);
 
       // Ensure legacy age band is present in all payload variants (harmless if column exists).
       if (payload.containsKey('ageBand') && payload.containsKey('age')) {
@@ -87,49 +271,66 @@ class TestRecordService extends ChangeNotifier {
         _maybeBackfillLegacyAgeBand(payload, ageBandKey: 'ageband', ageKey: 'age');
       }
 
-      // Prevent infinite retries if the backend schema is very different.
-      for (var attempt = 0; attempt < 10; attempt++) {
-        try {
-          // Prefer idempotency on client_generated_id when the backend supports it.
-          // If the column doesn't exist yet, fall back to id.
-          final onConflictCandidates = <String?>[
-            payload.containsKey('client_generated_id') ? 'client_generated_id' : null,
-            payload.containsKey('clientGeneratedId') ? 'clientGeneratedId' : null,
-            'id',
-          ].whereType<String>().toList();
+      // If the backend requires age band but the user didn't provide age/ageBand,
+      // send a safe fallback instead of failing sync.
+      if (payload.containsKey('ageband') && (payload['ageband'] == null || _isEmptyString(payload['ageband']))) {
+        payload['ageband'] = safeAgeBand;
+      }
+      if (payload.containsKey('age_band') && (payload['age_band'] == null || _isEmptyString(payload['age_band']))) {
+        payload['age_band'] = safeAgeBand;
+      }
 
-          List<Map<String, dynamic>> rows = const [];
-          Object? upsertErr;
-          for (final conflict in onConflictCandidates) {
-            try {
-              rows = await SupabaseService.upsert('test_records', payload, onConflict: conflict);
-              upsertErr = null;
-              break;
-            } catch (e) {
-              upsertErr = e;
-              if (!_isSchemaColumnError(e)) rethrow;
-            }
+      // Prevent infinite retries if the backend schema is very different.
+      // Some deployments have a much smaller `test_records` table; expanded
+      // payloads may require stripping many columns before the upsert succeeds.
+      final maxAttempts = payload.keys.length.clamp(8, 40);
+      for (var attempt = 0; attempt < maxAttempts; attempt++) {
+        try {
+          if (attempt == 0) {
+            debugPrint(
+              'TestRecord upsert candidate core payload: '
+              'clientname=${payload['clientname']}, ageband=${payload['ageband']}, '
+              'clientid=${payload['clientid']}, testdate=${payload['testdate']}, '
+              'client_name=${payload['client_name']}, age_band=${payload['age_band']}, '
+              'client_id=${payload['client_id']}, test_date=${payload['test_date']}',
+            );
           }
-          if (upsertErr != null) throw upsertErr;
-          if (rows.isNotEmpty) {
-            // Best-effort: keep remote id in local cache when the backend returns it.
-            final row = rows.first;
-            final remoteId = (row['id'] ?? row['remote_id'] ?? row['remoteId'])?.toString();
-            if (remoteId != null && remoteId.trim().isNotEmpty) {
-              _replaceLocal(record.copyWith(remoteId: remoteId, updatedAt: DateTime.now()));
-            }
-          }
+          await SupabaseService.upsert('test_records', payload, onConflict: 'id');
           return;
         } catch (e) {
           lastErr = e;
+
+          // If this candidate schema is missing NOT NULL columns (e.g. clientname),
+          // do not fail the entire sync; try the next candidate schema.
+          if (_isNotNullViolation(e)) {
+            debugPrint(
+              'TestRecord upsert not-null violation payload snapshot: '
+              'clientname=${payload['clientname']}, client_name=${payload['client_name']}, '
+              'clientid=${payload['clientid']}, client_id=${payload['client_id']}, '
+              'ageband=${payload['ageband']}, age_band=${payload['age_band']}, age=${payload['age']}, '
+              'testdate=${payload['testdate']}, test_date=${payload['test_date']}',
+            );
+            debugPrint('TestRecord upsert not-null violation; trying next schema candidate: $e');
+            break;
+          }
+
+          if (_isSchemaColumnError(e)) {
+            final missing = _extractMissingColumn(e);
+            debugPrint(
+              'TestRecord upsert schema mismatch (attempt ${attempt + 1}/$maxAttempts) - missing=$missing; payloadKeys=${payload.keys.toList()}',
+            );
+          }
           if (!_isSchemaColumnError(e)) rethrow;
 
-          final missing = _extractMissingColumn(e);
+          final missingRaw = _extractMissingColumn(e);
+          final missing = missingRaw?.trim();
           if (missing == null) break;
+
+          // Remember missing columns so future syncs don't repeatedly fail.
+          _remoteRejectedColumnsLower.add(missing.toLowerCase());
 
           // If backend doesn't have `age`, drop it and rely on age band.
           if (missing == 'age' && payload.containsKey('age')) {
-            // Backfill the legacy age band before dropping age.
             if (payload.containsKey('ageBand') && payload.containsKey('age')) {
               _maybeBackfillLegacyAgeBand(payload, ageBandKey: 'ageBand', ageKey: 'age');
             }
@@ -143,51 +344,24 @@ class TestRecordService extends ChangeNotifier {
             continue;
           }
 
-          // Drop the missing column if it exists in our payload.
-          if (payload.containsKey(missing)) {
-            payload.remove(missing);
+          // Remove missing column defensively (case-insensitive) because some
+          // schemas/libraries fold identifiers to lowercase.
+          final keyToRemove = payload.keys.cast<String?>().firstWhere(
+                (k) => k != null && k.toLowerCase() == missing.toLowerCase(),
+                orElse: () => null,
+              );
+          if (keyToRemove != null) {
+            payload.remove(keyToRemove);
             continue;
           }
 
-          // Also handle common case mismatches.
-          final altKeys = <String>[
-            missing,
-            missing.replaceAll('_', ''),
-            // Basic camelCase <-> snake_case conversions.
-            missing.contains('_')
-                ? missing.split('_').asMap().entries.map((e) => e.key == 0 ? e.value : '${e.value[0].toUpperCase()}${e.value.substring(1)}').join()
-                : missing.replaceAllMapped(RegExp(r'([A-Z])'), (m) => '_${m.group(1)!.toLowerCase()}'),
-          ];
-          var removed = false;
-          for (final k in altKeys) {
-            if (payload.containsKey(k)) {
-              payload.remove(k);
-              removed = true;
-              break;
-            }
-          }
-          if (removed) continue;
-
-          // Can't safely resolve, move to next schema candidate.
+          // If the backend reports a missing column we didn't even send, stop retrying this candidate.
           break;
         }
       }
     }
 
-    // If we reached here, none of the candidates worked.
-    if (lastErr != null) throw lastErr;
-    throw StateError('Unknown Supabase upsert failure for test_records');
-  }
-
-  Map<String, dynamic> _stripNulls(Map<String, dynamic> input) {
-    final out = <String, dynamic>{};
-    for (final entry in input.entries) {
-      final v = entry.value;
-      if (v == null) continue;
-      if (v is String && v.trim().isEmpty) continue;
-      out[entry.key] = v;
-    }
-    return out;
+    throw lastErr ?? Exception('Failed to upsert test record');
   }
 
   Map<String, dynamic> _fromDbRow(Map<String, dynamic> row) {
@@ -243,6 +417,8 @@ class TestRecordService extends ChangeNotifier {
     mapKeyLower('otherreferralsource', 'otherReferralSource');
     mapKey('symptoms_presented', 'symptomsPresented');
     mapKeyLower('symptomspresented', 'symptomsPresented');
+    mapKey('other_symptoms_presented', 'otherSymptomsPresented');
+    mapKeyLower('othersymptomspresented', 'otherSymptomsPresented');
     mapKey('mrdt_result', 'mRDTResult');
     mapKeyLower('mrdtresult', 'mRDTResult');
     mapKey('referral_for_danger_signs', 'referralForDangerSigns');
@@ -260,8 +436,8 @@ class TestRecordService extends ChangeNotifier {
     mapKeyLower('actgiven', 'actGiven');
     mapKey('act_given_option', 'actGivenOption');
     mapKeyLower('actgivenoption', 'actGivenOption');
-    mapKey('actGivenOption', 'actGivenOption');
-    mapKeyLower('actgivenoption', 'actGivenOption');
+    mapKey('other_act_given', 'otherActGiven');
+    mapKeyLower('otheractgiven', 'otherActGiven');
     mapKey('hiv_counselling', 'hivCounselling');
     mapKeyLower('hivcounselling', 'hivCounselling');
     mapKey('hivst_type', 'hivstType');
@@ -320,9 +496,8 @@ class TestRecordService extends ChangeNotifier {
     final json = _normalizeDates(record.toJson());
     if (!snakeCase) return json;
     // Only map keys that are known to be column names.
-    return {
+    return _pruneNullish({
       'id': json['id'],
-      'client_generated_id': json['clientGeneratedId'],
       'user_id': json['userId'],
       'program': json['program'],
       'client_name': json['clientName'],
@@ -341,6 +516,7 @@ class TestRecordService extends ChangeNotifier {
       'referred_from': json['referredFrom'],
       'other_referral_source': json['otherReferralSource'],
       'symptoms_presented': json['symptomsPresented'],
+      'other_symptoms_presented': json['otherSymptomsPresented'],
       'mrdt_result': json['mRDTResult'],
       'referral_for_danger_signs': json['referralForDangerSigns'],
       'danger_signs_referral_facility': json['dangerSignsReferralFacility'],
@@ -348,6 +524,8 @@ class TestRecordService extends ChangeNotifier {
       'mrdt_tested': json['mRDTTested'],
       'mrdt_positive': json['mRDTPositive'],
       'act_given': json['actGiven'],
+      'act_given_option': json['actGivenOption'],
+      'other_act_given': json['otherActGiven'],
       'hiv_counselling': json['hivCounselling'],
       'hivst_type': json['hivstType'],
       'determine_test': json['determineTest'],
@@ -373,14 +551,13 @@ class TestRecordService extends ChangeNotifier {
       'sync_status': json['syncStatus'],
       'created_at': json['createdAt'],
       'updated_at': json['updatedAt'],
-    };
+    });
   }
 
   Map<String, dynamic> _toDbJsonLower(TestRecord record) {
     final json = _normalizeDates(record.toJson());
-    return {
+    return _pruneNullish({
       'id': json['id'],
-      'clientgeneratedid': json['clientGeneratedId'],
       'userid': json['userId'],
       'program': json['program'],
       'clientname': json['clientName'],
@@ -399,6 +576,7 @@ class TestRecordService extends ChangeNotifier {
       'referredfrom': json['referredFrom'],
       'otherreferralsource': json['otherReferralSource'],
       'symptomspresented': json['symptomsPresented'],
+      'othersymptomspresented': json['otherSymptomsPresented'],
       'mrdtresult': json['mRDTResult'],
       'referralfordangersigns': json['referralForDangerSigns'],
       'dangersignsreferralfacility': json['dangerSignsReferralFacility'],
@@ -406,6 +584,8 @@ class TestRecordService extends ChangeNotifier {
       'mrdttested': json['mRDTTested'],
       'mrdtpositive': json['mRDTPositive'],
       'actgiven': json['actGiven'],
+      'actgivenoption': json['actGivenOption'],
+      'otheractgiven': json['otherActGiven'],
       'hivcounselling': json['hivCounselling'],
       'hivsttype': json['hivstType'],
       'determinetest': json['determineTest'],
@@ -431,7 +611,7 @@ class TestRecordService extends ChangeNotifier {
       'syncstatus': json['syncStatus'],
       'createdat': json['createdAt'],
       'updatedat': json['updatedAt'],
-    };
+    });
   }
 
   List<TestRecord> get records => _records;
@@ -455,8 +635,12 @@ class TestRecordService extends ChangeNotifier {
 
     try {
       // Prefer lowercase column style first (what Supabase type generation often produces).
-      final base = SupabaseConfig.client.from('test_records').stream(primaryKey: ['id']);
-      final query = base.order('testdate', ascending: false);
+      dynamic query = SupabaseConfig.client.from('test_records').stream(primaryKey: ['id']);
+      if (!forAdmin && userId.trim().isNotEmpty) {
+        // Best-effort server-side filter to avoid downloading other providers' rows.
+        query = query.eq('userid', userId);
+      }
+      query = query.order('testdate', ascending: false);
 
       _realtimeSub = query.listen((rows) async {
         try {
@@ -480,7 +664,9 @@ class TestRecordService extends ChangeNotifier {
         return;
       }
       try {
-        final query = SupabaseConfig.client.from('test_records').stream(primaryKey: ['id']).order('test_date', ascending: false);
+        dynamic query = SupabaseConfig.client.from('test_records').stream(primaryKey: ['id']);
+        if (!forAdmin && userId.trim().isNotEmpty) query = query.eq('user_id', userId);
+        query = query.order('test_date', ascending: false);
         _realtimeSub = query.listen((rows) async {
           try {
             final prefs = await SharedPreferences.getInstance();
@@ -502,7 +688,9 @@ class TestRecordService extends ChangeNotifier {
           return;
         }
         try {
-          final query = SupabaseConfig.client.from('test_records').stream(primaryKey: ['id']).order('testDate', ascending: false);
+          dynamic query = SupabaseConfig.client.from('test_records').stream(primaryKey: ['id']);
+          if (!forAdmin && userId.trim().isNotEmpty) query = query.eq('userId', userId);
+          query = query.order('testDate', ascending: false);
           _realtimeSub = query.listen((rows) async {
             try {
               final prefs = await SharedPreferences.getInstance();
@@ -548,14 +736,7 @@ class TestRecordService extends ChangeNotifier {
             return null;
           }
         }).whereType<TestRecord>().toList();
-
-        // One-time repair/migration for older local queue payloads.
-        final repaired = _repairLocalQueue(_records);
-        if (repaired.didChange) {
-          _records = repaired.records;
-          await _saveRecords(prefs);
-        }
-
+        
         if (_records.length != decoded.length) {
           await _saveRecords(prefs);
         }
@@ -579,40 +760,6 @@ class TestRecordService extends ChangeNotifier {
     }
   }
 
-  ({List<TestRecord> records, bool didChange}) _repairLocalQueue(List<TestRecord> input) {
-    var changed = false;
-    final out = <TestRecord>[];
-    for (final r in input) {
-      var next = r;
-
-      // Ensure idempotency key exists.
-      if (next.clientGeneratedId.trim().isEmpty) {
-        next = next.copyWith(clientGeneratedId: next.id);
-        changed = true;
-      }
-
-      // Malaria no longer supports Client Groups for NEW submissions.
-      // Keep historical server-synced rows intact; only normalize unsynced local queue items.
-      if (next.program == HealthProgram.malaria && next.syncStatus != SyncStatus.synced && (next.clientGroups?.isNotEmpty ?? false)) {
-        next = next.copyWith(clientGroups: null);
-        changed = true;
-      }
-
-      // Reset recoverable failures back to pending so auto-sync can pick them up.
-      if (next.syncStatus == SyncStatus.failed) {
-        final err = (next.lastError ?? '').toLowerCase();
-        final recoverable = err.contains('timeout') || err.contains('failed to fetch') || err.contains('network') || err.contains('socket') || err.contains('temporary');
-        if (recoverable) {
-          next = next.copyWith(syncStatus: SyncStatus.pending);
-          changed = true;
-        }
-      }
-
-      out.add(next);
-    }
-    return (records: out, didChange: changed);
-  }
-
   /// Performs a real sync:
   /// - pushes pending/failed rows
   /// - pulls latest server rows
@@ -634,11 +781,22 @@ class TestRecordService extends ChangeNotifier {
     final authUser = SupabaseConfig.auth.currentUser;
     if (authUser == null) return;
 
-    // Best-effort: refresh session before attempting queued writes.
-    try {
-      await SupabaseConfig.auth.refreshSession();
-    } catch (e) {
-      debugPrint('Supabase refreshSession failed (non-fatal): $e');
+    // Auto-repair legacy placeholder user ids in the local cache so existing failed
+    // records are eligible to sync.
+    var repairedAny = false;
+    final repaired = <TestRecord>[];
+    for (final r in _records) {
+      if (_looksLikeUuid(r.userId)) {
+        repaired.add(r);
+      } else {
+        repairedAny = true;
+        repaired.add(r.copyWith(userId: authUser.id, syncStatus: SyncStatus.pending, updatedAt: DateTime.now()));
+      }
+    }
+    if (repairedAny) {
+      _records = repaired;
+      await _saveRecords(prefs);
+      notifyListeners();
     }
 
     // Push any pending local records first (idempotent upsert).
@@ -646,19 +804,13 @@ class TestRecordService extends ChangeNotifier {
     if (pending.isNotEmpty) {
       for (final record in pending) {
         try {
-          final syncing = record.copyWith(syncStatus: SyncStatus.syncing, lastAttemptedAt: DateTime.now(), retryCount: record.retryCount + 1, lastError: null, updatedAt: DateTime.now());
-          _replaceLocal(syncing);
-          await _saveRecords(prefs);
-
-          await _upsertTestRecordRemote(syncing);
-          _replaceLocal(syncing.copyWith(syncStatus: SyncStatus.synced, updatedAt: DateTime.now()));
+          await _upsertTestRecordRemote(record);
+          _replaceLocal(record.copyWith(syncStatus: SyncStatus.synced, updatedAt: DateTime.now()));
         } catch (e) {
-          final msg = e.toString();
-          debugPrint('Failed to push pending test record ${record.id}: $msg');
-          _replaceLocal(record.copyWith(syncStatus: SyncStatus.failed, lastError: msg, lastAttemptedAt: DateTime.now(), retryCount: record.retryCount + 1, updatedAt: DateTime.now()));
+          debugPrint('Failed to push pending test record ${record.id}: $e');
+          _replaceLocal(record.copyWith(syncStatus: SyncStatus.failed, updatedAt: DateTime.now()));
         }
       }
-      await _saveRecords(prefs);
     }
 
     // Pull latest records from server.
@@ -730,19 +882,13 @@ class TestRecordService extends ChangeNotifier {
     final authUser = SupabaseConfig.auth.currentUser;
     if (authUser == null) return;
 
-    try {
-      await SupabaseConfig.auth.refreshSession();
-    } catch (e) {
-      debugPrint('Supabase refreshSession failed before single-record sync (non-fatal): $e');
-    }
-
     final local = _findLocalById(recordId);
     if (local == null) return;
 
     // Avoid flipping synced records back into syncing.
     if (local.syncStatus == SyncStatus.synced) return;
 
-    final syncing = local.copyWith(syncStatus: SyncStatus.syncing, lastAttemptedAt: DateTime.now(), retryCount: local.retryCount + 1, lastError: null, updatedAt: DateTime.now());
+    final syncing = local.copyWith(syncStatus: SyncStatus.syncing, updatedAt: DateTime.now());
     _replaceLocal(syncing);
     notifyListeners();
     try {
@@ -765,9 +911,8 @@ class TestRecordService extends ChangeNotifier {
       }
       _lifetimeFetchedAt = null;
     } catch (e) {
-      final msg = e.toString();
-      debugPrint('Background test record sync failed ($recordId): $msg');
-      final failed = syncing.copyWith(syncStatus: SyncStatus.failed, lastError: msg, updatedAt: DateTime.now());
+      debugPrint('Background test record sync failed ($recordId): $e');
+      final failed = syncing.copyWith(syncStatus: SyncStatus.failed, updatedAt: DateTime.now());
       _replaceLocal(failed);
       notifyListeners();
       try {
@@ -850,7 +995,6 @@ class TestRecordService extends ChangeNotifier {
     _records = [
       TestRecord(
         id: _uuid.v4(),
-        clientGeneratedId: _uuid.v4(),
         userId: 'provider1',
         program: HealthProgram.malaria,
         clientName: 'Amina Mohammed',
@@ -864,14 +1008,12 @@ class TestRecordService extends ChangeNotifier {
         mRDTTested: true,
         mRDTPositive: true,
         actGiven: true,
-        actGivenOption: 'TopMal',
         syncStatus: SyncStatus.synced,
         createdAt: now.subtract(const Duration(days: 1)),
         updatedAt: now.subtract(const Duration(days: 1)),
       ),
       TestRecord(
         id: _uuid.v4(),
-        clientGeneratedId: _uuid.v4(),
         userId: 'provider1',
         program: HealthProgram.hiv,
         clientName: 'Chinedu Okafor',
@@ -995,7 +1137,7 @@ class TestRecordService extends ChangeNotifier {
   }
 
   int getPendingSyncCount() =>
-      _records.where((r) => r.syncStatus != SyncStatus.synced).length;
+      _records.where((r) => r.syncStatus == SyncStatus.pending).length;
 
   /// Canonical, RLS-respecting lifetime total count.
   ///

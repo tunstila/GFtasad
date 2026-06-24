@@ -12,6 +12,7 @@ import 'package:mediflow/services/fieldprovider_analytics_service.dart';
 import 'package:mediflow/services/superadmin_analytics_service.dart';
 import 'package:mediflow/supabase/supabase_config.dart';
 import 'package:mediflow/theme.dart';
+import 'package:mediflow/utils/csv_downloader.dart';
 import 'package:mediflow/widgets/app_account_menu.dart';
 import 'package:mediflow/widgets/metric_card.dart';
 import 'package:mediflow/widgets/date_range_filter_bar.dart';
@@ -30,6 +31,7 @@ class AdminDashboardScreen extends StatefulWidget {
 class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
   bool _refreshing = false;
   bool _startedRealtime = false;
+  bool _exportingAllTestsCsv = false;
 
   late DateTimeRange _range;
 
@@ -165,6 +167,36 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
     }).length;
   }
 
+  Future<void> _downloadAllTestRecordsCsv() async {
+    final auth = context.read<AuthService>();
+    if (!auth.isSuperAdminFull || _exportingAllTestsCsv) return;
+
+    setState(() => _exportingAllTestsCsv = true);
+    try {
+      final res = await SupabaseConfig.client.functions.invoke('export_all_test_records_csv');
+      final data = res.data;
+      if (data is! Map) throw Exception('Unexpected export response');
+      final filename = (data['filename'] ?? 'all_test_records.csv').toString();
+      final csv = (data['csv'] ?? '').toString();
+      if (csv.trim().isEmpty) throw Exception('Export returned an empty CSV');
+
+      final savedPath = await downloadCsv(filename: filename, csvUtf8: csv);
+      if (!mounted) return;
+
+      final rowCount = data['rowCount'];
+      final msg = savedPath == null
+          ? 'Downloaded ${rowCount ?? ''} rows.'
+          : 'Saved ${rowCount ?? ''} rows to: $savedPath';
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+    } catch (e) {
+      debugPrint('Export all test records CSV failed: $e');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Export failed. Please try again.')));
+    } finally {
+      if (mounted) setState(() => _exportingAllTestsCsv = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final auth = context.watch<AuthService>();
@@ -244,6 +276,29 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
                   style: context.textStyles.bodyMedium?.copyWith(color: scheme.onSurfaceVariant),
                 ),
                 const SizedBox(height: 18),
+
+                if (auth.isSuperAdminFull) ...[
+                  SizedBox(
+                    width: double.infinity,
+                    child: FilledButton.icon(
+                      onPressed: _exportingAllTestsCsv ? null : _downloadAllTestRecordsCsv,
+                      icon: _exportingAllTestsCsv
+                          ? SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: scheme.onPrimary))
+                          : Icon(Icons.download_outlined, color: scheme.onPrimary),
+                      label: Text('Download All Test Records CSV', style: TextStyle(color: scheme.onPrimary, fontWeight: FontWeight.w800)),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  SizedBox(
+                    width: double.infinity,
+                    child: OutlinedButton.icon(
+                      onPressed: () => context.push('/admin/login-tracker'),
+                      icon: Icon(Icons.history_rounded, color: scheme.primary),
+                      label: Text('Login Tracker', style: TextStyle(color: scheme.primary, fontWeight: FontWeight.w800)),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                ],
 
                 DateRangeFilterBar(range: _range, onPick: _pickRange),
                 const SizedBox(height: 12),

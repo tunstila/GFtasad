@@ -28,48 +28,29 @@ class StockRequestDetailScreen extends StatelessWidget {
       appBar: AppBar(
         title: const Text('Request Details'),
         actions: [
-          if (supplierView && request != null && request.status == StockRequestStatus.pending) ...[
-            IconButton(
-              tooltip: 'Reject',
-              onPressed: () async {
-                final note = await showModalBottomSheet<String?>(
-                  context: context,
-                  isScrollControlled: true,
-                  showDragHandle: true,
-                  builder: (_) => const _SupplierResponseNoteSheet(title: 'Reject request', actionLabel: 'Reject'),
-                );
-                if (!context.mounted) return;
+          if (supplierView && request != null) ...[
+            PopupMenuButton<StockRequestStatus>(
+              tooltip: 'Update status',
+              onSelected: (s) async {
                 try {
-                  await context.read<StockRequestService>().supplierReject(requestId: request.id, responseNote: note);
+                  await context.read<StockRequestService>().updateStatus(requestId: request.id, status: s);
                   if (!context.mounted) return;
-                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Request rejected')));
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Status updated')));
+                  final currentUser = auth.currentUser;
+                  if (currentUser != null) await context.read<StockRequestService>().loadForSupplier(currentUser.id);
                 } catch (e) {
                   if (!context.mounted) return;
-                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Failed to reject: $e')));
+                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Failed to update status: $e')));
                 }
               },
-              icon: Icon(Icons.block, color: scheme.error),
-            ),
-            IconButton(
-              tooltip: 'Accept',
-              onPressed: () async {
-                final note = await showModalBottomSheet<String?>(
-                  context: context,
-                  isScrollControlled: true,
-                  showDragHandle: true,
-                  builder: (_) => const _SupplierResponseNoteSheet(title: 'Accept request', actionLabel: 'Accept'),
-                );
-                if (!context.mounted) return;
-                try {
-                  await context.read<StockRequestService>().supplierAccept(requestId: request.id, responseNote: note);
-                  if (!context.mounted) return;
-                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Request accepted: delivery created')));
-                } catch (e) {
-                  if (!context.mounted) return;
-                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Failed to accept: $e')));
-                }
-              },
-              icon: Icon(Icons.check_circle, color: scheme.primary),
+              itemBuilder: (context) => const [
+                PopupMenuItem(value: StockRequestStatus.approved, child: Text('Approve')),
+                PopupMenuItem(value: StockRequestStatus.rejected, child: Text('Reject')),
+                PopupMenuItem(value: StockRequestStatus.in_transit, child: Text('Mark in transit')),
+                PopupMenuItem(value: StockRequestStatus.delivered, child: Text('Mark delivered')),
+                PopupMenuItem(value: StockRequestStatus.cancelled, child: Text('Cancel')),
+              ],
+              icon: const Icon(Icons.more_vert),
             ),
           ],
           const AppAccountMenu(),
@@ -120,56 +101,6 @@ class StockRequestDetailScreen extends StatelessWidget {
                   ],
                 ),
               ),
-      ),
-    );
-  }
-}
-
-class _SupplierResponseNoteSheet extends StatefulWidget {
-  final String title;
-  final String actionLabel;
-  const _SupplierResponseNoteSheet({required this.title, required this.actionLabel});
-
-  @override
-  State<_SupplierResponseNoteSheet> createState() => _SupplierResponseNoteSheetState();
-}
-
-class _SupplierResponseNoteSheetState extends State<_SupplierResponseNoteSheet> {
-  final _ctrl = TextEditingController();
-
-  @override
-  void dispose() {
-    _ctrl.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return SafeArea(
-      child: Padding(
-        padding: EdgeInsets.only(left: 16, right: 16, bottom: 16 + MediaQuery.of(context).viewInsets.bottom, top: 8),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(widget.title, style: context.textStyles.titleLarge?.copyWith(fontWeight: FontWeight.w900)),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _ctrl,
-              minLines: 2,
-              maxLines: 4,
-              decoration: const InputDecoration(labelText: 'Response note (optional)'),
-            ),
-            const SizedBox(height: 16),
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton(
-                onPressed: () => context.pop(_ctrl.text.trim().isEmpty ? null : _ctrl.text.trim()),
-                child: Text(widget.actionLabel),
-              ),
-            ),
-          ],
-        ),
       ),
     );
   }

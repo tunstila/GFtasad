@@ -2,7 +2,6 @@ import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
 import 'package:mediflow/models/delivery.dart';
-import 'package:mediflow/models/user.dart';
 import 'package:mediflow/services/auth_service.dart';
 import 'package:mediflow/services/delivery_service.dart';
 import 'package:mediflow/theme.dart';
@@ -40,15 +39,11 @@ class _DeliveriesScreenState extends State<DeliveriesScreen> with SingleTickerPr
     final user = auth.currentUser;
     final deliveries = (user?.hasGlobalView ?? false)
         ? deliveryService.getAllDeliveries()
-        : (user?.role == UserRole.supplier)
-            ? deliveryService.getDeliveriesBySupplier(user?.id ?? '')
-            : deliveryService.getDeliveriesByProvider(user?.id ?? '');
+        : deliveryService.getDeliveriesByProvider(user?.id ?? '');
     final pending = deliveries.where((d) => d.status == DeliveryStatus.pending).toList();
     final accepted = deliveries.where((d) => d.status == DeliveryStatus.accepted).toList();
 
     final deliveryBadge = pending.length;
-
-    final navIndex = user?.role == UserRole.supplier ? 1 : 3;
 
     return Scaffold(
       appBar: AppBar(
@@ -97,7 +92,7 @@ class _DeliveriesScreenState extends State<DeliveriesScreen> with SingleTickerPr
           ],
         ),
       ),
-      bottomNavigationBar: ProviderBottomNav(currentIndex: navIndex, deliveryBadge: deliveryBadge),
+      bottomNavigationBar: ProviderBottomNav(currentIndex: 3, deliveryBadge: deliveryBadge),
     );
   }
 }

@@ -73,16 +73,6 @@ begin
     raise exception 'Selected product does not exist in system catalog';
   end if;
 
-  -- Block deactivated products (soft delete). Preserve history, prevent new entries.
-  if exists(
-    select 1
-    from public.commodities c
-    where c.id = product_id
-      and (coalesce(c.is_active, true) = false or coalesce(c.isactive, true) = false)
-  ) then
-    raise exception 'Selected product is no longer available for stock receipt';
-  end if;
-
   v_unit := nullif(trim(coalesce(unit_override, '')), '');
 
   -- Ensure settings row exists (this also supports low-stock notification engine).

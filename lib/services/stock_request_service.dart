@@ -26,7 +26,12 @@ class StockRequestService extends ChangeNotifier {
 
   Future<void> loadAllForAdmin() async {
     try {
-      final rows = await SupabaseService.select('stock_requests', orderBy: 'createdAt', ascending: false);
+      List<Map<String, dynamic>> rows;
+      try {
+        rows = await SupabaseService.select('stock_requests', orderBy: 'createdat', ascending: false);
+      } catch (_) {
+        rows = await SupabaseService.select('stock_requests', orderBy: 'createdAt', ascending: false);
+      }
       _allRequests = rows.map(_mapRow).toList();
       notifyListeners();
     } catch (e) {
@@ -42,10 +47,7 @@ class StockRequestService extends ChangeNotifier {
     if (authUser == null) return;
 
     try {
-      final query = SupabaseConfig.client
-          .from('stock_requests')
-          .stream(primaryKey: ['id'])
-          .order('createdAt', ascending: false);
+      final query = SupabaseConfig.client.from('stock_requests').stream(primaryKey: ['id']).order('createdat', ascending: false);
       _realtimeSub = query.listen((rows) {
         try {
           _allRequests = rows.map(_mapRow).toList();
@@ -66,95 +68,24 @@ class StockRequestService extends ChangeNotifier {
 
   Future<List<User>> fetchSuppliers() async {
     try {
-      // Least-privilege RPC: returns only safe supplier fields (not SETOF public.users).
-      // SECURITY DEFINER derives caller from auth.uid() and enforces role/scope server-side.
-      final res = await SupabaseConfig.client.rpc('get_available_suppliers_for_fieldprovider');
-      final rows = (res as List?) ?? const [];
-      final suppliers = rows.map((e) {
-        final m = Map<String, dynamic>.from(e as Map);
-        // Normalize the RPC's snake_case return columns into what User.fromJson accepts.
-        return User.fromJson({
-          'id': m['id'],
-          'username': m['username'] ?? '',
-          'name': m['name'],
-          'email': m['email'] ?? '',
-          'contact_email': m['contact_email'],
-          'facilityName': m['facility_name'],
-          'ward': m['ward'],
-          'lga': m['lga'],
-          'state': m['state'],
-          'role': m['role'],
-          'approvalstatus': m['approvalstatus'],
-          'created_at': m['created_at'],
-          'updated_at': m['updated_at'],
-        });
-      }).toList();
-
-      if (suppliers.isEmpty) {
-        debugPrint('fetchSuppliers(): get_available_suppliers_for_fieldprovider returned 0 rows. Fetching diagnostics...');
-        try {
-          final diag = await SupabaseConfig.client.rpc('get_available_suppliers_for_fieldprovider_diagnostics');
-          debugPrint('get_available_suppliers_for_fieldprovider_diagnostics: ${jsonEncode(diag)}');
-        } catch (diagErr) {
-          debugPrint('get_available_suppliers_for_fieldprovider_diagnostics failed: $diagErr');
-        }
-      }
-
-      return suppliers;
+      final rows = await SupabaseService.select('users', filters: {'role': UserRole.supplier.name}, orderBy: 'username', ascending: true);
+      return rows.map((e) => User.fromJson(e)).toList();
     } catch (e) {
-      debugPrint('fetchSuppliers(): supplier RPC failed: $e');
-      // Best-effort diagnostics to distinguish RLS/permission vs filter-empty.
-      try {
-        final diag = await SupabaseConfig.client.rpc('get_available_suppliers_for_fieldprovider_diagnostics');
-        debugPrint('get_available_suppliers_for_fieldprovider_diagnostics (after error): ${jsonEncode(diag)}');
-      } catch (diagErr) {
-        debugPrint('get_available_suppliers_for_fieldprovider_diagnostics (after error) failed: $diagErr');
-      }
+      debugPrint('Failed to fetch suppliers: $e');
       rethrow;
     }
-  }
-
-  Future<void> supplierAccept({required String requestId, String? responseNote}) async {
-    try {
-      await SupabaseConfig.client.rpc(
-        'supplier_accept_stock_request',
-        params: {
-          'p_request_id': requestId,
-          'p_response_note': responseNote,
-        },
-      );
-    } catch (e) {
-      debugPrint('supplier_accept_stock_request RPC failed: $e');
-      rethrow;
-    }
-
-    final authUser = SupabaseConfig.auth.currentUser;
-    if (authUser != null) await loadForSupplier(authUser.id);
-  }
-
-  Future<void> supplierReject({required String requestId, String? responseNote}) async {
-    try {
-      await SupabaseConfig.client.rpc(
-        'supplier_reject_stock_request',
-        params: {
-          'p_request_id': requestId,
-          'p_response_note': responseNote,
-        },
-      );
-    } catch (e) {
-      debugPrint('supplier_reject_stock_request RPC failed: $e');
-      rethrow;
-    }
-
-    final authUser = SupabaseConfig.auth.currentUser;
-    if (authUser != null) await loadForSupplier(authUser.id);
   }
 
   Future<void> loadForProvider(String providerId) async {
     _isLoading = true;
     notifyListeners();
     try {
-      final rows = await SupabaseService.select('stock_requests', filters: {'providerId': providerId}, orderBy: 'createdAt', ascending: false);
+      List<Map<String, dynamic>> rows;
+      try {
+        rows = await SupabaseService.select('stock_requests', filters: {'providerid': providerId}, orderBy: 'createdat', ascending: false);
+      } catch (_) {
+        rows = await SupabaseService.select('stock_requests', filters: {'providerId': providerId}, orderBy: 'createdAt', ascending: false);
+      }
       _providerRequests = rows.map(_mapRow).toList();
     } catch (e) {
       debugPrint('Failed to load provider stock requests: $e');
@@ -169,7 +100,12 @@ class StockRequestService extends ChangeNotifier {
     _isLoading = true;
     notifyListeners();
     try {
-      final rows = await SupabaseService.select('stock_requests', filters: {'supplierId': supplierId}, orderBy: 'createdAt', ascending: false);
+      List<Map<String, dynamic>> rows;
+      try {
+        rows = await SupabaseService.select('stock_requests', filters: {'supplierid': supplierId}, orderBy: 'createdat', ascending: false);
+      } catch (_) {
+        rows = await SupabaseService.select('stock_requests', filters: {'supplierId': supplierId}, orderBy: 'createdAt', ascending: false);
+      }
       _supplierRequests = rows.map(_mapRow).toList();
     } catch (e) {
       debugPrint('Failed to load supplier stock requests: $e');
@@ -180,66 +116,25 @@ class StockRequestService extends ChangeNotifier {
     }
   }
 
-  Future<String> createRestockRequest({
-    required String supplierId,
-    required String commodityId,
-    required int quantityRequested,
-    required String unitOfExpression,
-    String? notes,
-  }) async {
-    try {
-      final res = await SupabaseConfig.client.rpc(
-        'create_restock_request',
-        params: {
-          'p_supplier_id': supplierId,
-          'p_commodity_id': commodityId,
-          'p_quantity_requested': quantityRequested,
-          'p_unit_of_expression': unitOfExpression,
-          'p_notes': notes,
-        },
-      );
-
-      // RPC returns a UUID (as String) in most PostgREST configurations.
-      final id = res?.toString();
-      if (id == null || id.trim().isEmpty) {
-        throw Exception('Restock request created but no id returned');
-      }
-
-      // Best-effort refresh for current user context.
-      final authUser = SupabaseConfig.auth.currentUser;
-      if (authUser != null) {
-        await Future.wait([
-          loadForProvider(authUser.id),
-          loadForSupplier(authUser.id),
-        ]);
-      }
-
-      return id;
-    } catch (e) {
-      debugPrint('create_restock_request RPC failed: $e');
-      rethrow;
-    }
-  }
-
   Future<String?> createRequest({required User provider, required User supplier, required List<StockRequestItem> items, String? notes}) async {
     final now = DateTime.now();
     final payload = {
-      'providerId': provider.id,
-      'providerName': provider.username,
-      'providerEmail': provider.email,
-      'providerFacilityName': provider.facilityName,
-      'providerBusinessAddress': provider.businessAddress,
-      'providerState': provider.state,
-      'providerLga': provider.lga,
-      'providerLatitude': provider.latitude,
-      'providerLongitude': provider.longitude,
-      'supplierId': supplier.id,
-      'supplierName': supplier.username,
+      'providerid': provider.id,
+      'providername': provider.username,
+      'provideremail': provider.email,
+      'providerfacilityname': provider.facilityName,
+      'providerbusinessaddress': provider.businessAddress,
+      'providerstate': provider.state,
+      'providerlga': provider.lga,
+      'providerlatitude': provider.latitude,
+      'providerlongitude': provider.longitude,
+      'supplierid': supplier.id,
+      'suppliername': supplier.username,
       'status': StockRequestStatus.pending.toDb(),
       'items': items.map((e) => e.toJson()).toList(),
       if (notes != null && notes.trim().isNotEmpty) 'notes': notes.trim(),
-      'createdAt': now.toIso8601String(),
-      'updatedAt': now.toIso8601String(),
+      'createdat': now.toIso8601String(),
+      'updatedat': now.toIso8601String(),
     };
 
     try {
@@ -259,7 +154,7 @@ class StockRequestService extends ChangeNotifier {
 
   Future<void> updateStatus({required String requestId, required StockRequestStatus status}) async {
     try {
-      await SupabaseService.update('stock_requests', {'status': status.toDb(), 'updatedAt': DateTime.now().toIso8601String()}, filters: {'id': requestId});
+      await SupabaseService.update('stock_requests', {'status': status.toDb(), 'updatedat': DateTime.now().toIso8601String()}, filters: {'id': requestId});
     } catch (e) {
       debugPrint('Failed to update stock request status: $e');
       rethrow;
@@ -278,9 +173,30 @@ class StockRequestService extends ChangeNotifier {
       decoded = const [];
     }
 
-    return StockRequest.fromJson({
-      ...row,
-      'items': decoded,
-    });
+    final out = <String, dynamic>{...row, 'items': decoded};
+    void mapKey(String from, String to) {
+      if (out.containsKey(from) && !out.containsKey(to)) out[to] = out[from];
+    }
+
+    mapKey('providerid', 'providerId');
+    mapKey('providername', 'providerName');
+    mapKey('provideremail', 'providerEmail');
+    mapKey('providerfacilityname', 'providerFacilityName');
+    mapKey('providerbusinessaddress', 'providerBusinessAddress');
+    mapKey('providerstate', 'providerState');
+    mapKey('providerlga', 'providerLga');
+    mapKey('providerlatitude', 'providerLatitude');
+    mapKey('providerlongitude', 'providerLongitude');
+    mapKey('supplierid', 'supplierId');
+    mapKey('suppliername', 'supplierName');
+    mapKey('createdat', 'createdAt');
+    mapKey('updatedat', 'updatedAt');
+
+    for (final key in ['createdAt', 'updatedAt']) {
+      final v = out[key];
+      if (v is DateTime) out[key] = v.toIso8601String();
+    }
+
+    return StockRequest.fromJson(out);
   }
 }

@@ -16,39 +16,6 @@ class ProviderBottomNav extends StatelessWidget {
     final role = auth.currentUser?.role;
     final canRecord = role?.canRecordTests ?? false;
 
-    // Supplier UX: only Home, Deliveries, Profile.
-    if (role == UserRole.supplier) {
-      final idx = currentIndex.clamp(0, 2);
-      return Container(
-        decoration: BoxDecoration(border: Border(top: BorderSide(color: Theme.of(context).colorScheme.outline.withValues(alpha: 0.2), width: 1))),
-        child: NavigationBar(
-          selectedIndex: idx,
-          onDestinationSelected: (index) {
-            switch (index) {
-              case 0:
-                context.go('/provider-home');
-                break;
-              case 1:
-                context.go('/deliveries');
-                break;
-              case 2:
-                context.go('/provider-profile');
-                break;
-            }
-          },
-          destinations: [
-            const NavigationDestination(icon: Icon(Icons.home_outlined), selectedIcon: Icon(Icons.home), label: 'Home'),
-            NavigationDestination(
-              icon: Badge(isLabelVisible: deliveryBadge > 0, label: Text('$deliveryBadge'), child: const Icon(Icons.local_shipping_outlined)),
-              selectedIcon: Badge(isLabelVisible: deliveryBadge > 0, label: Text('$deliveryBadge'), child: const Icon(Icons.local_shipping)),
-              label: 'Deliveries',
-            ),
-            const NavigationDestination(icon: Icon(Icons.person_outline), selectedIcon: Icon(Icons.person), label: 'Profile'),
-          ],
-        ),
-      );
-    }
-
     return Container(
       decoration: BoxDecoration(border: Border(top: BorderSide(color: Theme.of(context).colorScheme.outline.withValues(alpha: 0.2), width: 1))),
       child: NavigationBar(

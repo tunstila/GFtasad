@@ -14,6 +14,103 @@ class DeliveryService extends ChangeNotifier {
 
   StreamSubscription<List<Map<String, dynamic>>>? _realtimeSub;
 
+  static bool _looksLikeUuid(String? v) {
+    if (v == null) return false;
+    final s = v.trim();
+    if (s.isEmpty) return false;
+    return RegExp(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$').hasMatch(s);
+  }
+
+  static bool _isSchemaColumnError(Object e) {
+    final msg = e.toString();
+    return msg.contains('schema cache') || msg.contains('does not exist') || msg.contains("Could not find the '");
+  }
+
+  static String? _extractMissingColumn(Object e) {
+    final msg = e.toString();
+    final m1 = RegExp(r"Could not find the '([^']+)' column").firstMatch(msg);
+    if (m1 != null) return m1.group(1);
+    final m2 = RegExp(r'column\s+[\w\.]+\.(\w+)\s+does not exist').firstMatch(msg);
+    if (m2 != null) return m2.group(1);
+    return null;
+  }
+
+  Delivery _repairDeliveryForAuth(Delivery d, {required String authUserId}) {
+    // Older local sample data uses providerId like "provider1" which will fail
+    // when the remote schema expects a UUID.
+    var out = d;
+    if (!_looksLikeUuid(out.providerId)) {
+      out = out.copyWith(providerId: authUserId, syncStatus: SyncStatus.pending, updatedAt: DateTime.now());
+    }
+
+    // Some older local/sample deliveries also used placeholder supplier ids like "supplier1".
+    // In production schemas, supplier_id is typically a UUID FK; sending a placeholder causes:
+    // "invalid input syntax for type uuid: \"supplier1\"".
+    // We can't reliably infer the real supplier UUID offline, so we repair to the authenticated
+    // user id (only for clearly-placeholder values) to unblock sync.
+    if (!_looksLikeUuid(out.supplierId)) {
+      final s = out.supplierId.trim().toLowerCase();
+      final looksPlaceholder = s.isEmpty || s == 'supplier1' || s == 'supplier' || s.startsWith('supplier');
+      if (looksPlaceholder) {
+        out = out.copyWith(supplierId: authUserId, syncStatus: SyncStatus.pending, updatedAt: DateTime.now());
+      }
+    }
+    return out;
+  }
+
+  Future<void> _upsertDeliveryRemote(Delivery delivery, {required String authUserId}) async {
+    final repaired = _repairDeliveryForAuth(delivery, authUserId: authUserId);
+    final candidates = <Map<String, dynamic>>[
+      // Prefer snake_case first (most common in production Supabase schemas).
+      {
+        'id': repaired.id,
+        'supplier_id': repaired.supplierId,
+        'supplier_name': repaired.supplierName,
+        'provider_id': authUserId,
+        'delivery_date': repaired.deliveryDate.toIso8601String(),
+        'reference': repaired.reference,
+        'items': repaired.items.map((e) => e.toJson()).toList(),
+        'status': repaired.status.name,
+        'sync_status': repaired.syncStatus.name,
+        'created_at': repaired.createdAt.toIso8601String(),
+        'updated_at': DateTime.now().toIso8601String(),
+      },
+      // Lowercased unquoted-camelCase identifiers: createdAt -> createdat, providerId -> providerid.
+      Map<String, dynamic>.from(_deliveryToDbJsonLower(repaired))..['providerid'] = authUserId,
+      // Legacy camelCase (least likely).
+      Map<String, dynamic>.from(_normalizeDates(_deliveryToSupabaseJson(repaired)))..['providerId'] = authUserId,
+    ];
+
+    Object? lastErr;
+    for (final original in candidates) {
+      final payload = Map<String, dynamic>.from(original);
+
+      // Always enforce provider id on every schema variant.
+      if (payload.containsKey('providerid')) payload['providerid'] = authUserId;
+      if (payload.containsKey('provider_id')) payload['provider_id'] = authUserId;
+      if (payload.containsKey('providerId')) payload['providerId'] = authUserId;
+
+      for (var attempt = 0; attempt < 6; attempt++) {
+        try {
+          await SupabaseService.upsert('deliveries', payload, onConflict: 'id');
+          return;
+        } catch (e) {
+          lastErr = e;
+          if (!_isSchemaColumnError(e)) rethrow;
+          final missing = _extractMissingColumn(e);
+          if (missing == null) break;
+          if (payload.containsKey(missing)) {
+            payload.remove(missing);
+            continue;
+          }
+          break;
+        }
+      }
+    }
+
+    throw lastErr ?? Exception('Failed to upsert delivery');
+  }
+
   List<Delivery> get deliveries => _deliveries;
   bool get isLoading => _isLoading;
 
@@ -23,15 +120,16 @@ class DeliveryService extends ChangeNotifier {
     if (authUser == null) return;
 
     try {
-      final query = SupabaseConfig.client.from('deliveries').stream(primaryKey: ['id']).order('deliveryDate', ascending: false);
+      final query = SupabaseConfig.client.from('deliveries').stream(primaryKey: ['id']).order('deliverydate', ascending: false);
 
       _realtimeSub = query.listen((rows) async {
         try {
           final prefs = await SharedPreferences.getInstance();
-          final filtered = forAdmin ? rows : rows.where((r) => r['providerId']?.toString() == providerId).toList();
+          final filtered = forAdmin
+              ? rows
+              : rows.where((r) => (r['providerid'] ?? r['provider_id'] ?? r['providerId'])?.toString() == providerId).toList();
           _deliveries = filtered.map((row) {
-            final normalized = _normalizeDates(row);
-            return Delivery.fromJson(normalized).copyWith(syncStatus: SyncStatus.synced);
+            return Delivery.fromJson(_fromDbRow(row)).copyWith(syncStatus: SyncStatus.synced);
           }).toList();
           await _saveDeliveries(prefs);
           notifyListeners();
@@ -93,12 +191,29 @@ class DeliveryService extends ChangeNotifier {
     final authUser = SupabaseConfig.auth.currentUser;
     if (authUser == null) return;
 
+    // Auto-repair legacy local ids (e.g. providerId="provider1") so existing failed
+    // pending deliveries can sync successfully.
+    var repairedAny = false;
+    final repaired = <Delivery>[];
+    for (final d in _deliveries) {
+      final fixed = _repairDeliveryForAuth(d, authUserId: authUser.id);
+      repaired.add(fixed);
+      if (!identical(fixed, d) && (fixed.providerId != d.providerId || fixed.syncStatus != d.syncStatus)) {
+        repairedAny = true;
+      }
+    }
+    if (repairedAny) {
+      _deliveries = repaired;
+      await _saveDeliveries(prefs);
+      notifyListeners();
+    }
+
     // Push pending local deliveries.
     final pending = _deliveries.where((d) => d.syncStatus == SyncStatus.pending || d.syncStatus == SyncStatus.failed).toList();
     if (pending.isNotEmpty) {
       for (final d in pending) {
         try {
-          await SupabaseService.upsert('deliveries', _normalizeDates(_deliveryToSupabaseJson(d)), onConflict: 'id');
+          await _upsertDeliveryRemote(d, authUserId: authUser.id);
           _replaceLocal(d.copyWith(syncStatus: SyncStatus.synced, updatedAt: DateTime.now()));
         } catch (e) {
           debugPrint('Failed to push pending delivery ${d.id}: $e');
@@ -109,19 +224,19 @@ class DeliveryService extends ChangeNotifier {
 
     // Pull from server (deliveries relevant to this provider).
     try {
-      final remote = await SupabaseService.select(
-        'deliveries',
-        filters: {'providerId': authUser.id},
-        orderBy: 'deliveryDate',
-        ascending: false,
-      );
+      List<Map<String, dynamic>> remote;
+      try {
+        remote = await SupabaseService.select('deliveries', filters: {'providerid': authUser.id}, orderBy: 'deliverydate', ascending: false);
+      } catch (e) {
+        // Fallback for other schema styles.
+        remote = await SupabaseService.select('deliveries', filters: {'provider_id': authUser.id}, orderBy: 'delivery_date', ascending: false);
+      }
 
       final localById = {for (final d in _deliveries) d.id: d};
       var changed = false;
 
       for (final row in remote) {
-        final normalized = _normalizeDates(row);
-        final remoteDelivery = Delivery.fromJson(normalized);
+        final remoteDelivery = Delivery.fromJson(_fromDbRow(row));
         final local = localById[remoteDelivery.id];
         if (local == null || remoteDelivery.updatedAt.isAfter(local.updatedAt)) {
           localById[remoteDelivery.id] = remoteDelivery.copyWith(syncStatus: SyncStatus.synced);
@@ -174,6 +289,62 @@ class DeliveryService extends ChangeNotifier {
       if (v is DateTime) out[key] = v.toIso8601String();
     }
     return out;
+  }
+
+  Map<String, dynamic> _fromDbRow(Map<String, dynamic> row) {
+    // Most of our models still use camelCase, but the DB commonly ends up with lowercase
+    // when columns were created as unquoted camelCase (e.g. createdAt -> createdat).
+    final out = <String, dynamic>{...row};
+
+    void mapKey(String from, String to) {
+      if (out.containsKey(from) && !out.containsKey(to)) out[to] = out[from];
+    }
+
+    mapKey('supplierid', 'supplierId');
+    mapKey('supplier_id', 'supplierId');
+    mapKey('suppliername', 'supplierName');
+    mapKey('supplier_name', 'supplierName');
+    mapKey('providerid', 'providerId');
+    mapKey('provider_id', 'providerId');
+    mapKey('deliverydate', 'deliveryDate');
+    mapKey('delivery_date', 'deliveryDate');
+    mapKey('syncstatus', 'syncStatus');
+    mapKey('sync_status', 'syncStatus');
+    mapKey('createdat', 'createdAt');
+    mapKey('created_at', 'createdAt');
+    mapKey('updatedat', 'updatedAt');
+    mapKey('updated_at', 'updatedAt');
+
+    // Ensure date fields are ISO strings for our JSON model.
+    for (final key in ['deliveryDate', 'createdAt', 'updatedAt']) {
+      final v = out[key];
+      if (v is DateTime) out[key] = v.toIso8601String();
+    }
+
+    // Items can come back as List<dynamic> already.
+    final items = out['items'];
+    if (items is List) {
+      out['items'] = items.map((e) => (e is Map<String, dynamic>) ? e : Map<String, dynamic>.from(e as Map)).toList();
+    }
+
+    return out;
+  }
+
+  Map<String, dynamic> _deliveryToDbJsonLower(Delivery d) {
+    final json = d.toJson();
+    return {
+      'id': json['id'],
+      'supplierid': json['supplierId'],
+      'suppliername': json['supplierName'],
+      'providerid': json['providerId'],
+      'deliverydate': json['deliveryDate'],
+      'reference': json['reference'],
+      'items': d.items.map((e) => e.toJson()).toList(),
+      'status': json['status'],
+      'syncstatus': json['syncStatus'],
+      'createdat': json['createdAt'],
+      'updatedat': json['updatedAt'],
+    };
   }
 
   Map<String, dynamic> _deliveryToSupabaseJson(Delivery d) {
@@ -289,14 +460,8 @@ class DeliveryService extends ChangeNotifier {
   int getAcceptedDeliveriesCountAll() =>
       _deliveries.where((d) => d.status == DeliveryStatus.accepted).length;
 
-  int getPendingDeliveriesCountForSupplier(String supplierId) =>
-      _deliveries.where((d) => d.supplierId == supplierId && d.status == DeliveryStatus.pending).length;
-
   List<Delivery> getDeliveriesByProvider(String providerId) =>
       _deliveries.where((d) => d.providerId == providerId).toList();
-
-  List<Delivery> getDeliveriesBySupplier(String supplierId) =>
-      _deliveries.where((d) => d.supplierId == supplierId).toList();
 
   List<Delivery> getAllDeliveries() => List.unmodifiable(_deliveries);
 

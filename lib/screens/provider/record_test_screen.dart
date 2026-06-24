@@ -8,6 +8,7 @@ import 'package:mediflow/models/test_record.dart';
 import 'package:mediflow/services/auth_service.dart';
 import 'package:mediflow/services/client_service.dart';
 import 'package:mediflow/services/test_record_service.dart';
+import 'package:mediflow/supabase/supabase_config.dart';
 import 'package:mediflow/theme.dart';
 import 'package:mediflow/widgets/program_badge.dart';
 import 'package:mediflow/widgets/yes_no_field.dart';
@@ -29,6 +30,17 @@ class _RecordTestScreenState extends State<RecordTestScreen> {
   late HealthProgram _program;
   late final bool _isUnsupportedProgram;
 
+  static String _ageBandFromAge(int age) {
+    if (age <= 4) return '0-4 years';
+    if (age <= 14) return '5-14 years';
+    if (age <= 24) return '15-24 years';
+    if (age <= 34) return '25-34 years';
+    if (age <= 44) return '35-44 years';
+    if (age <= 54) return '45-54 years';
+    if (age <= 64) return '55-64 years';
+    return '65+ years';
+  }
+
   bool _isSaving = false;
 
   // Common fields
@@ -47,13 +59,17 @@ class _RecordTestScreenState extends State<RecordTestScreen> {
   final _clientAddressController = TextEditingController();
   final _otherReferralSourceController = TextEditingController();
   final _dangerSignsReferralFacilityController = TextEditingController();
+  final _malariaOtherSymptomsController = TextEditingController();
+  final _malariaOtherActController = TextEditingController();
+  final _hivOtherSymptomsController = TextEditingController();
 
+  final Set<String> _malariaClientGroups = {};
   final Set<String> _malariaSymptoms = {};
 
   bool? _firstTimeVisitYes;
   String? _referredFrom;
   String? _mRdtResult; // "Positive" | "Negative"
-  String? _actGivenOption;
+  String? _malariaActGivenOption; // "TopMal" | "Others"
   bool? _referralForDangerSigns;
 
   // HIV fields
@@ -107,10 +123,27 @@ class _RecordTestScreenState extends State<RecordTestScreen> {
     _clientAddressController.dispose();
     _otherReferralSourceController.dispose();
     _dangerSignsReferralFacilityController.dispose();
+    _malariaOtherSymptomsController.dispose();
+    _malariaOtherActController.dispose();
+    _hivOtherSymptomsController.dispose();
     _clientLookupDebounce?.cancel();
     _otherReferralServiceController.dispose();
     _referralFacilityController.dispose();
     super.dispose();
+  }
+
+  static List<String> _hivClientGroupOptionsForSex(String sex) {
+    final normalized = sex.trim().toLowerCase();
+    if (normalized == 'male') return const ['GP', 'MSM', 'PWID', 'TG'];
+    if (normalized == 'female') return const ['GP', 'Pregnant', 'FSW', 'PG', 'PWID', 'AGYW'];
+    // Others / Other
+    return const ['GP', 'Pregnant', 'FSW', 'MSM', 'TG', 'PWID', 'AGYW'];
+  }
+
+  void _sanitizeHivClientGroupsForSex(String sex) {
+    if (_program != HealthProgram.hiv) return;
+    final allowed = _hivClientGroupOptionsForSex(sex).toSet();
+    _hivClientGroups.removeWhere((g) => !allowed.contains(g));
   }
 
   void _ensureClientIdGenerated() {
@@ -246,10 +279,9 @@ class _RecordTestScreenState extends State<RecordTestScreen> {
       final testRecordService = context.read<TestRecordService>();
       final clientService = context.read<ClientService>();
 
-      final currentUser = authService.currentUser;
-      if (currentUser == null || currentUser.id.trim().isEmpty) {
-        throw Exception('You must be logged in to record a test. Please sign in again.');
-      }
+      final sessionUserId = SupabaseConfig.auth.currentUser?.id;
+      final effectiveUserId = (authService.currentUser?.id ?? '').trim().isNotEmpty ? authService.currentUser!.id : (sessionUserId ?? '');
+      if (effectiveUserId.trim().isEmpty) throw StateError('Not authenticated');
 
       // Phase 1 (fast): local commit only. Do NOT block on any network calls.
       // Ensure we always have a stable clientId for the record, even offline.
@@ -265,36 +297,41 @@ class _RecordTestScreenState extends State<RecordTestScreen> {
        final feverPresented = malariaSymptoms.contains('Fever');
        final mRdtPositive = _mRdtResult == 'Positive';
 
-      final actLegacyBool = (_program == HealthProgram.malaria)
-          ? (() {
-              final v = (_actGivenOption ?? '').trim();
-              if (v.isEmpty) return null;
-              return v != 'None';
-            })()
-          : null;
+       final otherSymptoms = _malariaSymptoms.contains('Others') ? _malariaOtherSymptomsController.text.trim() : null;
+       if (!_malariaSymptoms.contains('Others')) _malariaOtherSymptomsController.clear();
 
-      final recordId = _uuid.v4();
+       final malariaActOption = (_malariaActGivenOption ?? '').trim().isEmpty ? null : _malariaActGivenOption;
+       final otherAct = malariaActOption == 'Others' ? _malariaOtherActController.text.trim() : null;
+       if (malariaActOption != 'Others') _malariaOtherActController.clear();
+
+      final hivOtherSymptoms = _program == HealthProgram.hiv && _tbSymptoms.contains('Others') ? _hivOtherSymptomsController.text.trim() : null;
+      if (_program == HealthProgram.hiv && !_tbSymptoms.contains('Others')) _hivOtherSymptomsController.clear();
+
       final record = TestRecord(
-        id: recordId,
-        clientGeneratedId: recordId,
-        userId: currentUser.id,
+        id: _uuid.v4(),
+        userId: effectiveUserId,
         program: _program,
-        clientName: _clientNameController.text,
+        clientName: _clientNameController.text.trim(),
         clientId: localClientId,
         age: int.tryParse(_ageController.text.trim()),
+        ageBand: (() {
+          final age = int.tryParse(_ageController.text.trim());
+          if (age == null) return null;
+          return _ageBandFromAge(age);
+        })(),
         dateOfBirth: null,
         phoneNumber: _phoneController.text.trim(),
         testDate: DateTime.now(),
         sex: _sex,
         pregnant: _sex == 'Female' ? _pregnant : null,
-        visitType: (_program == HealthProgram.malaria)
+        visitType: (_program == HealthProgram.malaria || _program == HealthProgram.hiv)
             ? ((_firstTimeVisitYes == true) ? VisitType.newVisit : VisitType.returnVisit)
             : _visitType,
 
         clientAddress: (_program == HealthProgram.malaria || _program == HealthProgram.hiv) ? _clientAddressController.text.trim() : null,
-        // Client Groups are no longer collected for Malaria records.
+        // Malaria: Client Group removed from the form (preserve historical DB values; do not write new ones).
         clientGroups: _program == HealthProgram.hiv ? (_hivClientGroups.toList()..sort()) : null,
-        firstTimeVisit: _program == HealthProgram.malaria ? _firstTimeVisitYes : null,
+        firstTimeVisit: (_program == HealthProgram.malaria || _program == HealthProgram.hiv) ? _firstTimeVisitYes : null,
         referredFrom: _program == HealthProgram.malaria ? _referredFrom : (_program == HealthProgram.hiv ? _hivReferredFrom : null),
         otherReferralSource: () {
           if (_program == HealthProgram.malaria && _referredFrom == 'Others') return _otherReferralSourceController.text.trim();
@@ -302,6 +339,7 @@ class _RecordTestScreenState extends State<RecordTestScreen> {
           return null;
         }(),
         symptomsPresented: _program == HealthProgram.malaria ? malariaSymptoms : null,
+        otherSymptomsPresented: _program == HealthProgram.malaria ? otherSymptoms : (_program == HealthProgram.hiv ? hivOtherSymptoms : null),
         mRDTResult: _program == HealthProgram.malaria ? _mRdtResult : null,
         referralForDangerSigns: _program == HealthProgram.malaria ? _referralForDangerSigns : null,
         dangerSignsReferralFacility: _program == HealthProgram.malaria && _referralForDangerSigns == true ? _dangerSignsReferralFacilityController.text.trim() : null,
@@ -310,8 +348,10 @@ class _RecordTestScreenState extends State<RecordTestScreen> {
         feverPresented: _program == HealthProgram.malaria ? feverPresented : null,
         mRDTTested: _program == HealthProgram.malaria ? true : null,
         mRDTPositive: _program == HealthProgram.malaria ? mRdtPositive : null,
-        actGiven: _program == HealthProgram.malaria ? actLegacyBool : null,
-        actGivenOption: _program == HealthProgram.malaria ? _actGivenOption : null,
+        // Legacy boolean is kept for dashboards; new malaria flow stores the option string.
+        actGiven: _program == HealthProgram.malaria ? (malariaActOption == null ? null : true) : null,
+        actGivenOption: _program == HealthProgram.malaria ? malariaActOption : null,
+        otherActGiven: _program == HealthProgram.malaria ? otherAct : null,
         hivCounselling: _program == HealthProgram.hiv ? _hivCounselling : null,
         // Preserve legacy HIV columns for historical records, but do not write new data into them.
         hivstType: null,
@@ -355,6 +395,7 @@ class _RecordTestScreenState extends State<RecordTestScreen> {
                 phoneNumber: _phoneController.text,
                 // Backend allocates the sequential code; we do not send placeholders.
                 desiredClientId: '',
+                ward: authService.currentUser?.ward,
               );
               final resolved = (client?.clientId ?? '').trim();
               if (resolved.isNotEmpty && resolved != localClientId) {
@@ -370,6 +411,7 @@ class _RecordTestScreenState extends State<RecordTestScreen> {
                 phoneNumber: _phoneController.text,
                 // Only accept a strict, already-generated code.
                 desiredClientId: rawClientId,
+                ward: authService.currentUser?.ward,
               );
             }
 
@@ -399,6 +441,60 @@ class _RecordTestScreenState extends State<RecordTestScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final auth = context.watch<AuthService>();
+    final user = auth.currentUser;
+    final mustGate = user?.role.name == 'fieldProvider' && user?.hasCompleteBusinessLocation != true;
+
+    if (mustGate) {
+      final scheme = Theme.of(context).colorScheme;
+      return Scaffold(
+        appBar: AppBar(
+          title: const Text('Record Test'),
+          leading: IconButton(icon: const Icon(Icons.arrow_back), onPressed: () => context.pop()),
+          actions: const [AppAccountMenu()],
+        ),
+        body: SafeArea(
+          child: Center(
+            child: Padding(
+              padding: AppSpacing.paddingLg,
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 520),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Container(
+                      width: 72,
+                      height: 72,
+                      decoration: BoxDecoration(color: scheme.error.withValues(alpha: 0.10), borderRadius: BorderRadius.circular(24)),
+                      child: Icon(Icons.location_off_outlined, color: scheme.error, size: 34),
+                    ),
+                    const SizedBox(height: 14),
+                    Text('Business profile required', style: context.textStyles.titleLarge?.copyWith(fontWeight: FontWeight.w900)),
+                    const SizedBox(height: 8),
+                    const Text('Please complete your Business Profile State, LGA, and Ward before recording tests.', textAlign: TextAlign.center),
+                    const SizedBox(height: 18),
+                    SizedBox(
+                      width: double.infinity,
+                      child: FilledButton.icon(
+                        onPressed: () => context.push('/provider-profile/address'),
+                        icon: Icon(Icons.location_on_outlined, color: scheme.onPrimary),
+                        label: Text('Go to Profile → Business', style: TextStyle(color: scheme.onPrimary, fontWeight: FontWeight.w800)),
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    SizedBox(
+                      width: double.infinity,
+                      child: OutlinedButton(onPressed: () => context.go('/select-program'), child: const Text('Back to programs')),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
     if (_isUnsupportedProgram) {
       return Scaffold(
         appBar: AppBar(
@@ -580,9 +676,16 @@ class _RecordTestScreenState extends State<RecordTestScreen> {
           items: const [
             DropdownMenuItem(value: 'Male', child: Text('Male')),
             DropdownMenuItem(value: 'Female', child: Text('Female')),
-            DropdownMenuItem(value: 'Other', child: Text('Other')),
+            DropdownMenuItem(value: 'Other', child: Text('Others')),
           ],
-          onChanged: (value) => setState(() => _sex = value!),
+          onChanged: (value) {
+            if (value == null) return;
+            setState(() {
+              _sex = value;
+              if (_sex != 'Female') _pregnant = false;
+              _sanitizeHivClientGroupsForSex(_sex);
+            });
+          },
         ),
         if (_sex == 'Female') ...[
           const SizedBox(height: 16),
@@ -616,6 +719,8 @@ class _RecordTestScreenState extends State<RecordTestScreen> {
 
   Widget _buildMalariaFields() {
     final showTbReferralPrompt = _malariaSymptoms.any((s) => s == 'Current Cough' || s == 'Weight Loss' || s == 'Night Sweats');
+    final showOtherSymptoms = _malariaSymptoms.contains('Others');
+    final showOtherAct = _malariaActGivenOption == 'Others';
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -655,11 +760,26 @@ class _RecordTestScreenState extends State<RecordTestScreen> {
         _MultiSelectChipsFormField(
           label: 'Symptoms Presented',
           icon: Icons.sick,
-          options: const ['Fever', 'Current Cough', 'Weight Loss', 'Night Sweats'],
+          options: const ['Fever', 'Current Cough', 'Weight Loss', 'Night Sweats', 'Others'],
           selected: _malariaSymptoms,
           requiredSelection: true,
-          onChanged: () => setState(() {}),
+          onChanged: () {
+            setState(() {
+              if (!_malariaSymptoms.contains('Others')) _malariaOtherSymptomsController.clear();
+            });
+          },
         ),
+        if (showOtherSymptoms) ...[
+          const SizedBox(height: 12),
+          TextFormField(
+            controller: _malariaOtherSymptomsController,
+            decoration: const InputDecoration(labelText: 'Other symptom(s)', prefixIcon: Icon(Icons.edit_note)),
+            validator: (v) {
+              if (!_malariaSymptoms.contains('Others')) return null;
+              return (v ?? '').trim().isEmpty ? 'Please specify other symptom(s)' : null;
+            },
+          ),
+        ],
         if (showTbReferralPrompt) ...[
           const SizedBox(height: 12),
           Container(
@@ -697,16 +817,31 @@ class _RecordTestScreenState extends State<RecordTestScreen> {
         ),
         const SizedBox(height: 12),
         DropdownButtonFormField<String>(
-          value: _actGivenOption,
-          decoration: const InputDecoration(labelText: 'ACT Given?', prefixIcon: Icon(Icons.medication)),
+          value: _malariaActGivenOption,
+          decoration: const InputDecoration(labelText: 'ACT Given', prefixIcon: Icon(Icons.medication)),
           items: const [
             DropdownMenuItem(value: 'TopMal', child: Text('TopMal')),
             DropdownMenuItem(value: 'Others', child: Text('Others')),
-            DropdownMenuItem(value: 'None', child: Text('None')),
           ],
           validator: (v) => (v ?? '').trim().isEmpty ? 'Required' : null,
-          onChanged: (v) => setState(() => _actGivenOption = v),
+          onChanged: (v) {
+            setState(() {
+              _malariaActGivenOption = v;
+              if (v != 'Others') _malariaOtherActController.clear();
+            });
+          },
         ),
+        if (showOtherAct) ...[
+          const SizedBox(height: 12),
+          TextFormField(
+            controller: _malariaOtherActController,
+            decoration: const InputDecoration(labelText: 'Other ACT given', prefixIcon: Icon(Icons.edit_note)),
+            validator: (v) {
+              if (_malariaActGivenOption != 'Others') return null;
+              return (v ?? '').trim().isEmpty ? 'Please specify the ACT given' : null;
+            },
+          ),
+        ],
         const SizedBox(height: 12),
         DropdownButtonFormField<bool>(
           value: _referralForDangerSigns,
@@ -744,6 +879,8 @@ class _RecordTestScreenState extends State<RecordTestScreen> {
     final showHivstDetails = _htsType == HTSType.hivst;
     final showRecommendationReactive = _hivTestResult == HIVTestResult.reactive;
     final showRecommendationNonReactive = _hivTestResult == HIVTestResult.nonReactive;
+    final clientGroupOptions = _hivClientGroupOptionsForSex(_sex);
+    final showOtherTbSymptoms = _tbSymptoms.contains('Others');
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -758,14 +895,33 @@ class _RecordTestScreenState extends State<RecordTestScreen> {
         _MultiSelectChipsFormField(
           label: 'Client Group',
           icon: Icons.groups_2_outlined,
-          options: const ['GP', 'Pregnant', 'FSW', 'MSM', 'TG', 'PWID', 'AGYW'],
+          options: clientGroupOptions,
           selected: _hivClientGroups,
-          requiredSelection: false,
-          onChanged: () => setState(() {}),
+          requiredSelection: true,
+          validator: (selected) {
+            if (selected.isEmpty) return 'Client group is required';
+            final allowed = clientGroupOptions.toSet();
+            final invalid = selected.where((g) => !allowed.contains(g)).toList();
+            if (invalid.isNotEmpty) return 'Select a valid client group for selected Sex';
+            return null;
+          },
+          onChanged: () {
+            setState(() {
+              _sanitizeHivClientGroupsForSex(_sex);
+            });
+          },
         ),
         const SizedBox(height: 12),
-        // Visit Type is captured in the shared (top) section for HIV.
-        // We intentionally do not ask a duplicate "First time visit" question here.
+        DropdownButtonFormField<bool>(
+          value: _firstTimeVisitYes,
+          decoration: const InputDecoration(labelText: 'First time visit?', prefixIcon: Icon(Icons.history_toggle_off)),
+          items: const [
+            DropdownMenuItem(value: true, child: Text('Yes')),
+            DropdownMenuItem(value: false, child: Text('No')),
+          ],
+          validator: (v) => v == null ? 'Required' : null,
+          onChanged: (v) => setState(() => _firstTimeVisitYes = v),
+        ),
         const SizedBox(height: 12),
         DropdownButtonFormField<String>(
           value: _hivReferredFrom,
@@ -797,11 +953,12 @@ class _RecordTestScreenState extends State<RecordTestScreen> {
         const SizedBox(height: 12),
         DropdownButtonFormField<HIVPreviousTesting>(
           value: _hivPreviousTesting,
+          isExpanded: true,
           decoration: const InputDecoration(labelText: 'Tested for HIV before within this year?', prefixIcon: Icon(Icons.quiz_outlined)),
           items: const [
             DropdownMenuItem(value: HIVPreviousTesting.notPreviouslyTested, child: Text('Not previously tested')),
             DropdownMenuItem(value: HIVPreviousTesting.previouslyTestedNegative, child: Text('Previously tested negative')),
-            DropdownMenuItem(value: HIVPreviousTesting.previouslyTestedPositive, child: Text('Previously tested positive')),
+            DropdownMenuItem(value: HIVPreviousTesting.previouslyTestedPositive, child: Text('Previously tested positive on HIV care')),
             DropdownMenuItem(value: HIVPreviousTesting.previouslyTestedPositiveNotOnCare, child: Text('Previously tested positive not on HIV care')),
           ],
           validator: (v) => v == null ? 'Required' : null,
@@ -871,6 +1028,7 @@ class _RecordTestScreenState extends State<RecordTestScreen> {
           items: const [
             DropdownMenuItem(value: HIVTestResult.reactive, child: Text('Reactive')),
             DropdownMenuItem(value: HIVTestResult.nonReactive, child: Text('Non-reactive')),
+            DropdownMenuItem(value: HIVTestResult.invalid, child: Text('Invalid')),
           ],
           validator: (v) => v == null ? 'Required' : null,
           onChanged: (v) {
@@ -916,7 +1074,7 @@ class _RecordTestScreenState extends State<RecordTestScreen> {
         _MultiSelectChipsFormField(
           label: 'Symptoms Presented',
           icon: Icons.sick_outlined,
-          options: const ['Fever', 'Current Cough', 'Weight loss', 'Night sweats'],
+          options: const ['Fever', 'Current Cough', 'Weight loss', 'Night sweats', 'Others'],
           selected: _tbSymptoms,
           requiredSelection: false,
           onChanged: () {
@@ -927,19 +1085,19 @@ class _RecordTestScreenState extends State<RecordTestScreen> {
               if (trigger && !_referralServices.contains('TB presumptive') && !_referralServices.contains('No referral')) {
                 _referralServices.add('TB presumptive');
               }
+              if (!_tbSymptoms.contains('Others')) _hivOtherSymptomsController.clear();
             });
           },
         ),
-        if (_suggestTBReferral) ...[
+        if (showOtherTbSymptoms) ...[
           const SizedBox(height: 12),
-          Container(
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: scheme.tertiaryContainer,
-              borderRadius: BorderRadius.circular(AppRadius.md),
-              border: Border.all(color: scheme.tertiary.withValues(alpha: 0.25)),
-            ),
-            child: Text('TB referral prompt: symptoms beyond only Fever. Refer for TB services where appropriate.', style: Theme.of(context).textTheme.bodySmall?.copyWith(color: scheme.onTertiaryContainer, height: 1.4)),
+          TextFormField(
+            controller: _hivOtherSymptomsController,
+            decoration: const InputDecoration(labelText: 'Other symptom(s)', prefixIcon: Icon(Icons.edit_note_outlined)),
+            validator: (v) {
+              if (!_tbSymptoms.contains('Others')) return null;
+              return (v ?? '').trim().isEmpty ? 'Please specify other symptom(s)' : null;
+            },
           ),
         ],
 
@@ -1066,10 +1224,13 @@ class _MultiSelectChipsFormField extends FormField<Set<String>> {
     required List<String> options,
     required Set<String> selected,
     required bool requiredSelection,
+    String? Function(Set<String> selected)? validator,
     required VoidCallback onChanged,
   }) : super(
           initialValue: selected,
           validator: (v) {
+            final custom = validator;
+            if (custom != null) return custom(v ?? <String>{});
             if (!requiredSelection) return null;
             if (v == null || v.isEmpty) return 'Select at least one';
             return null;

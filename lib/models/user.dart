@@ -112,6 +112,17 @@ class User {
   bool get hasGlobalView => effectiveRole.hasGlobalView;
   bool get canMutateOperationalData => effectiveRole.canMutateOperationalData;
 
+  /// True when the Business profile has the minimum location fields required for
+  /// generating strict client codes and recording program data.
+  ///
+  /// We treat null/blank/whitespace-only as missing.
+  bool get hasCompleteBusinessLocation {
+    final s = (state ?? '').trim();
+    final l = (lga ?? '').trim();
+    final w = (ward ?? '').trim();
+    return s.isNotEmpty && l.isNotEmpty && w.isNotEmpty;
+  }
+
   /// Email that is safe to show in UI.
   ///
   /// For username-only accounts we intentionally hide the synthetic auth email.
@@ -172,7 +183,7 @@ class User {
       return UserRole.values.firstWhere((e) => e.name == raw, orElse: () => UserRole.fieldProvider);
     })(),
     approvalStatus: (() {
-      final raw = json['approvalstatus']?.toString() ?? json['approvalStatus']?.toString() ?? json['approval_status']?.toString();
+      final raw = json['approvalStatus']?.toString() ?? json['approval_status']?.toString();
       if (raw == null) return (json['isApproved'] == true ? UserApprovalStatus.approved : UserApprovalStatus.approved);
       return UserApprovalStatus.values.firstWhere((e) => e.name == raw, orElse: () => UserApprovalStatus.approved);
     })(),

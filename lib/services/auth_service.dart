@@ -56,6 +56,9 @@ class AuthLoginResult {
 class AuthService extends ChangeNotifier {
   static const String superAdminBootstrapEmail = 'tundeoyelana@gmail.com';
 
+  static const String _loginSessionPrefsKey = 'active_login_session_id_v1';
+  static const Duration _heartbeatInterval = Duration(minutes: 2);
+
   static const Duration _signupStepTimeout = Duration(seconds: 30);
 
   static final RegExp _missingColumnRe = RegExp(r"Could not find the '([^']+)' column");
@@ -63,9 +66,13 @@ class AuthService extends ChangeNotifier {
   User? _currentUser;
   bool _isLoading = false;
 
+  Timer? _heartbeatTimer;
+  String? _activeLoginSessionId;
+
   User? get currentUser => _currentUser;
   bool get isLoading => _isLoading;
-  bool get isAuthenticated => _currentUser != null;
+  bool get hasValidSupabaseSession => SupabaseConfig.auth.currentSession != null;
+  bool get isAuthenticated => _currentUser != null && hasValidSupabaseSession;
 
   bool get isSuperAdminView => _currentUser?.effectiveRole.hasGlobalView == true;
   bool get isSuperAdminFull => _currentUser?.effectiveRole == UserRole.superAdmin;
@@ -78,7 +85,7 @@ class AuthService extends ChangeNotifier {
     if (user.hasGlobalView) return '/admin/dashboard';
     if (user.role == UserRole.nationalMalaria) return '/national/malaria';
     if (user.role == UserRole.nationalHIVTB) return '/national/hivtb';
-    if (user.role == UserRole.supplier) return '/provider-home';
+    if (user.role == UserRole.supplier) return '/supplier/stock-requests';
     return '/provider-home';
   }
 
@@ -128,10 +135,17 @@ class AuthService extends ChangeNotifier {
   String? _lastAdminOperationError;
   String? get lastAdminOperationError => _lastAdminOperationError;
 
+  String? _lastBusinessProfileError;
+  String? get lastBusinessProfileError => _lastBusinessProfileError;
+
   void _setLastAdminOperationError(String? message) {
     _lastAdminOperationError = message;
     // Not calling notifyListeners() here because most callers just read it
     // immediately after awaiting an operation.
+  }
+
+  void _setLastBusinessProfileError(String? message) {
+    _lastBusinessProfileError = message;
   }
 
   // Admin-only: ephemeral password visibility.
@@ -159,6 +173,17 @@ class AuthService extends ChangeNotifier {
         _currentUser = User.fromJson(jsonDecode(cached));
       }
 
+      _activeLoginSessionId = prefs.getString(_loginSessionPrefsKey);
+
+      // Important: a locally cached user is NOT proof of an authenticated Supabase session.
+      // If the session is missing/expired, we must clear the cache so the app routes to /login
+      // and avoids server calls that will fail with `not_authenticated`.
+      if (_currentUser != null && SupabaseConfig.auth.currentSession == null) {
+        debugPrint('Clearing cached user because Supabase session is missing (prevent not_authenticated).');
+        await _clearCachedUser();
+        _currentUser = null;
+      }
+
       final authUser = SupabaseConfig.auth.currentUser;
       if (authUser != null) {
         // Best-effort: ensure backend schema additions (IDs/clients/batch fields) exist.
@@ -173,6 +198,9 @@ class AuthService extends ChangeNotifier {
           _currentUser = _applyBootstrapAdmin(profile);
           await _hydrateBusinessAddressForCurrentUser();
           await _cacheCurrentUser(_currentUser);
+
+          // Best-effort: begin or resume login session tracking.
+          unawaited(_ensureLoginSessionTracking(prefs));
         }
       }
     } catch (e) {
@@ -228,6 +256,14 @@ class AuthService extends ChangeNotifier {
       _currentUser = bootstrapped.copyWith(lastLogin: DateTime.now(), updatedAt: DateTime.now());
       await _hydrateBusinessAddressForCurrentUser();
       await _cacheCurrentUser(_currentUser);
+
+      // Best-effort: begin login session tracking for audit logs.
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        await _beginLoginSession(prefs);
+      } catch (e) {
+        debugPrint('Login session tracking start failed (non-fatal): $e');
+      }
 
       // Ensure fieldprovider ID immediately after login (helps older accounts).
       if (_currentUser?.role == UserRole.fieldProvider && (_currentUser?.state ?? '').trim().isNotEmpty && (_currentUser?.fieldProviderUniqueId ?? '').trim().isEmpty) {
@@ -520,6 +556,17 @@ class AuthService extends ChangeNotifier {
   }
 
   Future<void> logout() async {
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = null;
+
+    // Best-effort: end the session BEFORE signOut so the JWT is still valid.
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await _endLoginSession(prefs);
+    } catch (e) {
+      debugPrint('Login session end failed (non-fatal): $e');
+    }
+
     try {
       await SupabaseConfig.auth.signOut();
     } catch (e) {
@@ -529,6 +576,85 @@ class AuthService extends ChangeNotifier {
     await _clearCachedUser();
     _currentUser = null;
     notifyListeners();
+  }
+
+  Future<void> _ensureLoginSessionTracking(SharedPreferences prefs) async {
+    if (SupabaseConfig.auth.currentSession == null) return;
+    if (_activeLoginSessionId == null || _activeLoginSessionId!.trim().isEmpty) {
+      await _beginLoginSession(prefs);
+    } else {
+      // Ping quickly so we don't keep stale sessions forever.
+      unawaited(_sendHeartbeat(sessionId: _activeLoginSessionId));
+      _startHeartbeatTimer();
+    }
+  }
+
+  Future<void> _beginLoginSession(SharedPreferences prefs) async {
+    if (SupabaseConfig.auth.currentSession == null) return;
+    try {
+      final res = await SupabaseConfig.client.functions.invoke(
+        'login_tracker',
+        body: {
+          'action': 'start_session',
+          'appPlatform': kIsWeb ? 'web' : 'mobile',
+        },
+      );
+
+      final data = res.data;
+      final session = data is Map ? data['session'] : null;
+      final sessionId = session is Map ? session['id']?.toString() : null;
+      if (sessionId == null || sessionId.trim().isEmpty) return;
+
+      _activeLoginSessionId = sessionId.trim();
+      await prefs.setString(_loginSessionPrefsKey, _activeLoginSessionId!);
+      _startHeartbeatTimer();
+    } catch (e) {
+      debugPrint('Failed to begin login session (offline ok): $e');
+    }
+  }
+
+  void _startHeartbeatTimer() {
+    _heartbeatTimer?.cancel();
+    if (_activeLoginSessionId == null || _activeLoginSessionId!.trim().isEmpty) return;
+
+    _heartbeatTimer = Timer.periodic(_heartbeatInterval, (_) {
+      unawaited(_sendHeartbeat(sessionId: _activeLoginSessionId));
+    });
+  }
+
+  Future<void> _sendHeartbeat({String? sessionId}) async {
+    if (SupabaseConfig.auth.currentSession == null) return;
+    try {
+      await SupabaseConfig.client.functions.invoke(
+        'login_tracker',
+        body: {
+          'action': 'heartbeat',
+          if (sessionId != null && sessionId.trim().isNotEmpty) 'sessionId': sessionId.trim(),
+        },
+      );
+    } catch (e) {
+      debugPrint('Heartbeat failed (offline ok): $e');
+    }
+  }
+
+  Future<void> _endLoginSession(SharedPreferences prefs) async {
+    final sessionId = (_activeLoginSessionId ?? '').trim();
+    if (sessionId.isEmpty) {
+      await prefs.remove(_loginSessionPrefsKey);
+      return;
+    }
+
+    try {
+      await SupabaseConfig.client.functions.invoke(
+        'login_tracker',
+        body: {'action': 'end_session', 'sessionId': sessionId},
+      );
+    } catch (e) {
+      debugPrint('End session request failed (offline ok): $e');
+    } finally {
+      _activeLoginSessionId = null;
+      await prefs.remove(_loginSessionPrefsKey);
+    }
   }
 
   Future<bool> changePassword(String currentPassword, String newPassword) async {
@@ -572,46 +698,107 @@ class AuthService extends ChangeNotifier {
     final user = _currentUser;
     if (user == null) return false;
 
+    // Guard: RPC requires an authenticated JWT (auth.uid()).
+    // If the Supabase session is missing, the backend will return `not_authenticated`.
+    if (SupabaseConfig.auth.currentSession == null) {
+      _setLastBusinessProfileError('Your session has expired. Please log in again.');
+      debugPrint('updateBusinessProfile blocked: Supabase session is null for userId=${user.id}');
+      await logout();
+      return false;
+    }
+
+    // Best-effort refresh: ensures we have a valid access token before calling RPC.
+    try {
+      await SupabaseConfig.auth.refreshSession();
+    } catch (e) {
+      debugPrint('refreshSession failed (non-fatal): $e');
+    }
+
+    _setLastBusinessProfileError(null);
+
+    final addressNorm = businessAddress.trim();
+    final stateNorm = state.trim();
+    final lgaNorm = lga.trim();
+    final wardNorm = (ward ?? '').trim().isEmpty ? null : ward!.trim();
+
+    if (addressNorm.isEmpty) {
+      _setLastBusinessProfileError('Please enter your business address.');
+      return false;
+    }
+    if (stateNorm.isEmpty) {
+      _setLastBusinessProfileError('Please select your State.');
+      return false;
+    }
+    if (lgaNorm.isEmpty) {
+      _setLastBusinessProfileError('Please select your LGA.');
+      return false;
+    }
+
+    if (latitude != null && (latitude < -90 || latitude > 90)) {
+      _setLastBusinessProfileError('Latitude must be between -90 and 90.');
+      return false;
+    }
+    if (longitude != null && (longitude < -180 || longitude > 180)) {
+      _setLastBusinessProfileError('Longitude must be between -180 and 180.');
+      return false;
+    }
+
     final now = DateTime.now();
     try {
-      await _updateUserProfileFlexible(
-        userId: user.id,
-        updates: {
-          'state': state,
-          'lga': lga,
-          'businessAddress': businessAddress,
-          'ward': (ward ?? '').trim().isEmpty ? null : ward!.trim(),
-          'latitude': latitude,
-          'longitude': longitude,
-          'updatedAt': now,
+      // Canonical write path: RPC handles create-vs-update safely and is resilient to RLS.
+      final res = await SupabaseConfig.client.rpc(
+        'update_my_business_profile',
+        params: {
+          'p_business_address': addressNorm,
+          'p_state': stateNorm,
+          'p_lga': lgaNorm,
+          'p_ward': wardNorm,
+          'p_latitude': latitude,
+          'p_longitude': longitude,
         },
       );
 
-      // Source of truth for address fields.
-      await BusinessAddressService.upsert(
+      if (res is! Map) {
+        _setLastBusinessProfileError('Unexpected server response.');
+        debugPrint('update_my_business_profile unexpected response: ${res.runtimeType} $res');
+        return false;
+      }
+      final data = Map<String, dynamic>.from(res);
+      if (data['ok'] != true) {
+        final err = (data['error'] ?? 'Update failed').toString();
+        final detail = (data['detail'] ?? '').toString();
+        final msg = detail.trim().isNotEmpty ? '$err: $detail' : err;
+        _setLastBusinessProfileError(msg);
+        debugPrint('update_my_business_profile failed: $msg');
+        return false;
+      }
+
+      // Update local cache (and keep SharedPreferences cache in sync).
+      _currentUser = user.copyWith(
+        businessAddress: (data['businessAddress'] ?? addressNorm).toString(),
+        ward: (data['ward'] as String?)?.trim().isEmpty == true ? null : (data['ward'] as String?),
+        state: (data['state'] ?? stateNorm).toString(),
+        lga: (data['lga'] ?? lgaNorm).toString(),
+        latitude: (data['latitude'] as num?)?.toDouble() ?? latitude,
+        longitude: (data['longitude'] as num?)?.toDouble() ?? longitude,
+        updatedAt: now,
+      );
+      await _cacheCurrentUser(_currentUser);
+
+      // Keep offline cache aligned with canonical data (no additional remote write).
+      await BusinessAddressService.cacheOnly(
         BusinessAddress(
           userId: user.id,
-          businessAddress: businessAddress,
-          ward: (ward ?? '').trim().isEmpty ? null : ward!.trim(),
-          state: state,
-          lga: lga,
-          latitude: latitude,
-          longitude: longitude,
+          businessAddress: _currentUser!.businessAddress ?? addressNorm,
+          ward: _currentUser!.ward,
+          state: _currentUser!.state ?? stateNorm,
+          lga: _currentUser!.lga ?? lgaNorm,
+          latitude: _currentUser!.latitude,
+          longitude: _currentUser!.longitude,
           createdAt: now,
           updatedAt: now,
         ),
       );
-
-      _currentUser = user.copyWith(
-        businessAddress: businessAddress,
-        ward: (ward ?? '').trim().isEmpty ? null : ward!.trim(),
-        state: state,
-        lga: lga,
-        latitude: latitude,
-        longitude: longitude,
-        updatedAt: now,
-      );
-      await _cacheCurrentUser(_currentUser);
 
       // If this is a FieldProvider and they now have a state, ensure they have a unique
       // state-scoped ID.
@@ -633,7 +820,23 @@ class AuthService extends ChangeNotifier {
       notifyListeners();
       return true;
     } catch (e) {
-      debugPrint('Failed to update business profile: $e');
+      String raw = e.toString();
+      if (e is sb.PostgrestException) {
+        final parts = <String>[e.message];
+        if ((e.details ?? '').toString().trim().isNotEmpty) parts.add(e.details.toString());
+        if ((e.hint ?? '').toString().trim().isNotEmpty) parts.add('hint: ${e.hint}');
+        if ((e.code ?? '').toString().trim().isNotEmpty) parts.add('code: ${e.code}');
+        raw = parts.where((p) => p.trim().isNotEmpty).join(' • ');
+      }
+
+      // Keep production errors user-friendly, but keep full details in debug.
+      final msg = kDebugMode
+          ? raw
+          : (raw.contains('Could not find the function public.update_my_business_profile')
+              ? 'Update service is temporarily unavailable. Please try again later.'
+              : 'Failed to save. Please try again.');
+      _setLastBusinessProfileError(msg);
+      debugPrint('Failed to update business profile: $raw');
       return false;
     }
   }
@@ -974,7 +1177,7 @@ class AuthService extends ChangeNotifier {
       'fieldProviderUniqueId': row['fieldProviderUniqueId'] ?? row['fieldprovideruniqueid'] ?? row['field_provider_unique_id'] ?? row['fieldproviderid'] ?? row['field_provider_id'],
       'forcePasswordChange': row['forcePasswordChange'] ?? row['force_password_change'] ?? false,
       'lastLogin': row['lastLogin'] ?? row['last_login'],
-      'approvalStatus': row['approvalstatus'] ?? row['approvalStatus'] ?? row['approval_status'] ?? 'approved',
+      'approvalStatus': row['approvalStatus'] ?? row['approval_status'] ?? 'approved',
       'approvedAt': row['approvedAt'] ?? row['approved_at'],
       'approvedBy': row['approvedBy'] ?? row['approved_by'],
       'adminScope': row['adminScope'] ?? row['admin_scope'],
